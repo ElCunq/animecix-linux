@@ -438,6 +438,11 @@ impl SettingsView {
         root.set_margin_start(16);
         root.set_margin_end(16);
 
+        let settings_search = gtk::SearchEntry::new();
+        settings_search.set_placeholder_text(Some("Ayarlarda ara…"));
+        settings_search.set_hexpand(true);
+        root.append(&settings_search);
+
         let ep_group = adw::PreferencesGroup::new();
         ep_group.set_title("Hızlı Bölüm Arama");
 
@@ -578,6 +583,24 @@ impl SettingsView {
         perf_group.add(&patience_row);
         root.append(&perf_group);
 
+        // İndirilenler grubuna eklenecek satır (satır save_all'tan önce
+        // yaratılmalı; gruba ekleme aşağıda dl_group bölümünde).
+        let maxpar_row = adw::ActionRow::new();
+        maxpar_row.set_title("Aynı Anda İndirilen Bölüm");
+        maxpar_row.set_subtitle("Kaç bölüm eşzamanlı iner (1-32). Artırım yeni işlere uygulanır, devam edenler bölünmez.");
+        let maxpar_adj = gtk::Adjustment::new(
+            settings.max_parallel_downloads.clamp(1, 32) as f64,
+            1.0,
+            32.0,
+            1.0,
+            5.0,
+            0.0,
+        );
+        let maxpar_spin = gtk::SpinButton::new(Some(&maxpar_adj), 1.0, 0);
+        maxpar_spin.set_numeric(true);
+        maxpar_spin.set_value(settings.max_parallel_downloads.clamp(1, 32) as f64);
+        maxpar_row.add_suffix(&maxpar_spin);
+
         let img_group = adw::PreferencesGroup::new();
         img_group.set_title("Görüntü İyileştirme");
         let upscale_row = adw::ComboRow::new();
@@ -713,6 +736,7 @@ impl SettingsView {
             let cq_r = cover_q_row.clone();
             let light_r = light_sw.clone();
             let patience_spin_c = patience_spin.clone();
+            let maxpar_spin_c = maxpar_spin.clone();
             let ask_r = ask_sw.clone();
             let s = s_base.clone();
             let on_save = on_save.clone();
@@ -765,6 +789,8 @@ impl SettingsView {
                     .unwrap_or_else(|| crate::api::DEFAULT_COVER_QUALITY.to_string());
                 updated.light_mode = light_r.is_active();
                 updated.source_patience_secs = patience_spin_c.value() as u64;
+                updated.max_parallel_downloads =
+                    (maxpar_spin_c.value().round() as u64).clamp(1, 32);
                 updated.fansub_ask_each_time = ask_r.is_active();
                 on_save(updated);
             })
@@ -801,6 +827,8 @@ impl SettingsView {
         upscale_row.connect_selected_notify(move |_| sa8());
         let sa_cq = save_all.clone();
         cover_q_row.connect_selected_notify(move |_| sa_cq());
+        let sa_mp = save_all.clone();
+        maxpar_spin.connect_value_changed(move |_| sa_mp());
         let sa9 = save_all.clone();
         light_sw.connect_active_notify(move |_| sa9());
         let sa10 = save_all.clone();
@@ -820,6 +848,7 @@ impl SettingsView {
         dl_pick.set_valign(gtk::Align::Center);
         dl_dir_row.add_suffix(&dl_pick);
         dl_group.add(&dl_dir_row);
+        dl_group.add(&maxpar_row);
         root.insert_child_after(&dl_group, Some(&player_group));
         {
             let s_o = s_base.clone();
@@ -955,6 +984,116 @@ impl SettingsView {
 
         root.append(&info_group);
 
+        // Ayar arama: satır başlık+açar sözcüklerini gezer, uymayanı gizler.
+        // Grup başlığı her satırın metnine katılır; satırı kalmayan grup gizlenir.
+        // NOT: AdwPreferencesGroup'un ilk çocuğu satırlar değil iç kutudur;
+        // satırlar ListBox içinde derinde durur — o yüzden özyinelemeli toplanır.
+        let mut search_groups: Vec<(adw::PreferencesGroup, Vec<(gtk::Widget, String)>)> = Vec::new();
+        let mut gc = root.first_child();
+        while let Some(c) = gc {
+            let next = c.next_sibling();
+            if let Ok(g) = c.clone().downcast::<adw::PreferencesGroup>() {
+                let gt = g.title().to_string();
+                let mut rows = Vec::new();
+                collect_searchable(&g.clone().upcast(), &mut rows);
+                let rows = rows
+                    .into_iter()
+                    .map(|r| {
+                        let hay = tr_fold(&format!("{gt} {}", row_search_text(&r)));
+                        (r, hay)
+                    })
+                    .collect();
+                search_groups.push((g, rows));
+            }
+            gc = next;
+        }
+        settings_search.connect_search_changed(move |e| {
+            let q = tr_fold(e.text().trim());
+            for (g, rows) in &search_groups {
+                let mut any = false;
+                for (w, h) in rows {
+                    let show = q.is_empty() || h.contains(&q);
+                    w.set_visible(show);
+                    any = any || show;
+                }
+                g.set_visible(q.is_empty() || any);
+            }
+        });
+
         root
+    }
+}
+
+/// Türkçe duyarsız arama katlaması: I→ı/İ→i, küçük harf, aksan sadeleştirme.
+/// Hem satır metnine (bir kez) hem sorguya (her tuşta) uygulanır.
+pub fn tr_fold(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let mapped = match c {
+            'I' => 'ı',
+            'İ' => 'i',
+            _ => c,
+        };
+        for lc in mapped.to_lowercase() {
+            out.push(match lc {
+                'ö' => 'o',
+                'ü' => 'u',
+                'ğ' => 'g',
+                'ş' => 's',
+                'ç' => 'c',
+                'â' => 'a',
+                'î' => 'i',
+                'û' => 'u',
+                _ => lc,
+            });
+        }
+    }
+    out
+}
+
+/// Grup içindeki aranabilir satırları toplar (ActionRow + bağımsız butonlar).
+/// Satırın içine girilmez (anahtar/suffix ayrıca indekslenmez); başlık
+/// etiketleri atlanır (grup başlığı her satırın metnine ayrıca katılır).
+fn collect_searchable(w: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+    if w.clone().downcast::<adw::ActionRow>().is_ok()
+        || w.clone().downcast::<gtk::Button>().is_ok()
+    {
+        out.push(w.clone());
+        return;
+    }
+    let mut c = w.first_child();
+    while let Some(ch) = c {
+        let n = ch.next_sibling();
+        collect_searchable(&ch, out);
+        c = n;
+    }
+}
+
+fn row_search_text(w: &gtk::Widget) -> String {
+    if let Ok(r) = w.clone().downcast::<adw::ActionRow>() {
+        format!("{} {}", r.title(), r.subtitle().unwrap_or_default())
+    } else if let Ok(b) = w.clone().downcast::<gtk::Button>() {
+        b.label().unwrap_or_default().to_string()
+    } else if let Ok(l) = w.clone().downcast::<gtk::Label>() {
+        l.text().to_string()
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tr_fold;
+
+    #[test]
+    fn tr_fold_turkish_cases() {
+        assert_eq!(tr_fold("Görüntü"), "goruntu");
+        assert_eq!(tr_fold("goruntu"), "goruntu");
+        assert!(tr_fold("Görüntü İyileştirme").contains("goruntu"));
+        assert_eq!(tr_fold("Işık"), "ısık");
+        assert_eq!(tr_fold("ISIK"), "ısık");
+        assert_eq!(tr_fold("Kişisel"), "kisisel");
+        assert_eq!(tr_fold("Şırnak ÇĞ"), "sırnak cg");
+        assert_eq!(tr_fold("  Tema  "), "  tema  ");
     }
 }

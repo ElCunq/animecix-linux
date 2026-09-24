@@ -297,6 +297,8 @@ impl App {
         let (dl_tx, dl_rx) = std::sync::mpsc::channel::<crate::download::UiEvent>();
         let dl_manager =
             crate::download::DownloadManager::new(crate::download::queue_file_path(), dl_tx);
+        // Kayıtlı paralellik açılışta motora işlenir (eski dosya → 1).
+        dl_manager.set_max_parallel(client.load_settings().max_parallel_downloads as usize);
 
         let app_inst = Rc::new(Self {
             window,
@@ -371,6 +373,7 @@ impl App {
         {
             // İndirme pompası: kuyruk olaylarını arayüze taşır.
             let pump = app_inst.clone_ref();
+            let pump_rm = pump.remove_hint_cb();
             let rx = std::sync::Arc::new(std::sync::Mutex::new(dl_rx));
             glib::timeout_add_local(std::time::Duration::from_millis(1500), move || {
                 let mut progress_dirty = false;
@@ -409,6 +412,7 @@ impl App {
                                         row,
                                         rec,
                                         &pump.dl_manager,
+                                        &pump_rm,
                                     );
                                 }
                             }
@@ -1304,9 +1308,26 @@ impl App {
         let (scroll, rows) = crate::ui::downloads_view::DownloadsView::build(
             &self.dl_manager,
             self.effective_download_dir(),
+            self.remove_hint_cb(),
         );
         *self.dl_rows.borrow_mut() = rows;
         scroll
+    }
+
+    /// Listeden silme ipucu (bir kez, 10sn): bitmiş video silinmez.
+    fn remove_hint_cb(&self) -> std::rc::Rc<dyn Fn()> {
+        let this = self.clone_ref();
+        std::rc::Rc::new(move || {
+            if this.settings.borrow().seen_remove_hint {
+                return;
+            }
+            let toast = adw::Toast::new("Listeden silindi — tamamlanan video dosyası silinmez.");
+            toast.set_timeout(10);
+            this.toast.add_toast(toast);
+            this.settings.borrow_mut().seen_remove_hint = true;
+            let s = this.settings.borrow().clone();
+            this.client.save_settings(&s);
+        })
     }
 
     fn build_settings_view(&self) -> gtk::ScrolledWindow {
@@ -1327,6 +1348,11 @@ impl App {
                 *this_save.settings.borrow_mut() = new_s.clone();
                 this_save.client.save_settings(&new_s);
                 this_save.client.set_cf_clearance(&new_s.cf_clearance);
+                if new_s.max_parallel_downloads != old_s.max_parallel_downloads {
+                    // Artırım bekleyen işleri hemen başlatır; azaltım
+                    // devam edenleri bölmez, yeni alımı kısar.
+                    this_save.dl_manager.set_max_parallel(new_s.max_parallel_downloads as usize);
+                }
                 this_save.apply_ui_scale();
                 crate::theme::apply_theme(&this_save.window, &new_s.theme);
                 if new_s.cover_quality != old_s.cover_quality {

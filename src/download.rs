@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc, Arc,
 };
 
@@ -141,6 +141,7 @@ pub fn start_download(
     referer: Option<&str>,
     dest_final: &Path,
     tx: mpsc::Sender<DownloadEvent>,
+    segs: usize,
 ) -> DownloadHandle {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_r = cancel.clone();
@@ -163,12 +164,12 @@ pub fn start_download(
                 return;
             }
         };
-        // Temiz başlangıç + yeterince büyük + aralıklı sunucu → 6 eşzamanlı bağlantı.
+        // Temiz başlangıç + yeterince büyük + aralıklı sunucu → çok bağlantı.
         // Başarısızlıkta kısmi .part silinir, tek-bağlantıya düşülür (bozulma yok).
         if have == 0 {
             if let Some(total) = crate::segmented::probe_len(&client, &url, referer.as_deref()) {
                 if total >= crate::segmented::MIN_SEGMENTED_BYTES {
-                    eprintln!("[DL] 6 bağlantı: {total} bayt");
+                    eprintln!("[DL] {} bağlantı: {total} bayt", segs.max(1));
                     let seg_tx = tx.clone();
                     let seg_progress = move |done: u64, tot: u64| {
                         let _ = seg_tx.send(DownloadEvent::Progress(done, tot));
@@ -179,7 +180,7 @@ pub fn start_download(
                         referer.as_deref(),
                         &part,
                         total,
-                        crate::segmented::SEGMENTS,
+                        segs.max(1),
                         &seg_progress,
                         &cancel_r,
                     ) {
@@ -475,7 +476,18 @@ pub enum UiEvent {
     Toast(String),
 }
 
-/// Sıralı (tek tek) indirme yöneticisi. Klonlanabilir (paylaşımlı iç durum).
+/// Aynı anda en fazla kaç bölüm indirilir (1-32). Dosya-başı bağlantı
+/// sayısıyla çarpılır; host başına ≤6 soket için segmentler buna göre küçülür.
+pub(crate) fn effective_segments(max_parallel: usize) -> usize {
+    match max_parallel.max(1) {
+        1 => 6,
+        2 => 2,
+        3 => 2,
+        _ => 1,
+    }
+}
+
+/// Paralel (ayarlanabilir, 1-32 işçi) indirme yöneticisi. Klonlanabilir (paylaşımlı iç durum).
 #[derive(Clone)]
 pub struct DownloadManager {
     inner: Arc<ManagerInner>,
@@ -484,7 +496,9 @@ pub struct DownloadManager {
 struct ManagerInner {
     queue: std::sync::Mutex<Vec<DownloadRecord>>,
     handles: std::sync::Mutex<std::collections::HashMap<String, DownloadHandle>>,
-    worker_on: AtomicBool,
+    /// O an çalışan işçi sayısı (üst sınır: max_parallel).
+    active: AtomicUsize,
+    max_parallel: AtomicUsize,
     queue_path: PathBuf,
     ui_tx: mpsc::Sender<UiEvent>,
 }
@@ -504,7 +518,8 @@ impl DownloadManager {
             inner: Arc::new(ManagerInner {
                 queue: std::sync::Mutex::new(items),
                 handles: std::sync::Mutex::new(std::collections::HashMap::new()),
-                worker_on: AtomicBool::new(false),
+                active: AtomicUsize::new(0),
+                max_parallel: AtomicUsize::new(1),
                 queue_path,
                 ui_tx,
             }),
@@ -634,12 +649,54 @@ impl DownloadManager {
         }
     }
 
+    /// Paralellik üst sınırını günceller (1-32). Artırım bekleyen işleri
+    /// hemen başlatır; azaltım devam edenleri bölmez, yeni alımı kısar.
+    pub fn set_max_parallel(&self, n: usize) {
+        self.inner.max_parallel.store(n.clamp(1, 32), Ordering::SeqCst);
+        self.ensure_worker();
+    }
+
+    pub fn max_parallel(&self) -> usize {
+        self.inner.max_parallel.load(Ordering::SeqCst).clamp(1, 32)
+    }
+
     fn ensure_worker(&self) {
-        if self.inner.worker_on.swap(true, Ordering::SeqCst) {
-            return;
+        // Üst sınıra kadar izin ver; her izin ya işçiye dönüşür ya iade edilir.
+        // Azaltımda aktifler bitirir, yeni alım kısılır (preempt yok).
+        loop {
+            let max = self.max_parallel();
+            let prev = self.inner.active.fetch_add(1, Ordering::SeqCst);
+            if prev >= max {
+                self.inner.active.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+            let job = this_claim(&self.inner);
+            match job {
+                Some(rec) => {
+                    let this = self.clone();
+                    std::thread::spawn(move || {
+                        this.run_job(rec);
+                    });
+                }
+                None => {
+                    self.inner.active.fetch_sub(1, Ordering::SeqCst);
+                    return;
+                }
+            }
         }
+    }
+
+    /// Tek iş: indir, olayları işle, sayacı düşür, bekleyen varsa devam et.
+    fn run_job(&self, rec: DownloadRecord) {
+        // Kademeli başlatma: aynı saniyedeki SYN/TLS yığınını dağıt
+        // (leaky-bucket kısıtlaması tetiklenmesin). İlk iş beklemez.
+        let sibs = self.inner.active.load(Ordering::SeqCst).saturating_sub(1).min(3);
+        if sibs > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(2 * sibs as u64));
+        }
+        let segs = effective_segments(self.max_parallel());
         let this = self.clone();
-        std::thread::spawn(move || {
+        {
             let mut last_tick = std::time::Instant::now();
             let mut tick = |force: bool| {
                 if force || last_tick.elapsed() >= std::time::Duration::from_secs(1) {
@@ -647,87 +704,89 @@ impl DownloadManager {
                     this.emit(UiEvent::Tick);
                 }
             };
-            loop {
-                let job = this.inner.queue.lock().map(|mut q| {
-                    q.iter_mut()
-                        .find(|r| matches!(r.status, DownloadStatus::Queued))
-                        .map(|r| {
-                            r.status = DownloadStatus::Downloading;
-                            r.clone()
-                        })
-                });
-                let rec = match job {
-                    Ok(Some(r)) => r,
-                    _ => break,
-                };
-                this.save();
-                this.emit(UiEvent::Changed);
-                let (tx, rx) = mpsc::channel();
-                // aria2c varsa 6 bağlantı, yoksa iç motor (imza/olay sözleşmesi aynı).
-                let handle = if crate::aria::find_aria2c().is_some() {
-                    crate::aria::start_download_aria(&rec.url, rec.referer.as_deref(), &rec.dest, tx)
-                } else {
-                    start_download(&rec.url, rec.referer.as_deref(), &rec.dest, tx)
-                };
-                if let Ok(mut h) = this.inner.handles.lock() {
-                    h.insert(rec.id.clone(), handle);
-                }
-                for ev in rx.iter() {
-                    match ev {
-                        DownloadEvent::Progress(a, b) => {
-                            this.set_progress(&rec.id, a, b);
-                            tick(false);
+            this.save();
+            this.emit(UiEvent::Changed);
+            let (tx, rx) = mpsc::channel();
+            // aria2c varsa çok bağlantı, yoksa iç motor (imza/olay sözleşmesi aynı).
+            let handle = if crate::aria::find_aria2c().is_some() {
+                crate::aria::start_download_aria(&rec.url, rec.referer.as_deref(), &rec.dest, tx, segs as u32)
+            } else {
+                start_download(&rec.url, rec.referer.as_deref(), &rec.dest, tx, segs)
+            };
+            if let Ok(mut h) = this.inner.handles.lock() {
+                h.insert(rec.id.clone(), handle);
+            }
+            for ev in rx.iter() {
+                match ev {
+                    DownloadEvent::Progress(a, b) => {
+                        this.set_progress(&rec.id, a, b);
+                        tick(false);
+                    }
+                    DownloadEvent::Done => {
+                        this.set_status(&rec.id, DownloadStatus::Done);
+                        this.set_progress(&rec.id, rec.total.max(1), rec.total.max(1));
+                        // Gerçek boyutu diskten al.
+                        if let Ok(m) = std::fs::metadata(&rec.dest) {
+                            let len = m.len();
+                            this.set_progress(&rec.id, len, len);
                         }
-                        DownloadEvent::Done => {
-                            this.set_status(&rec.id, DownloadStatus::Done);
-                            this.set_progress(&rec.id, rec.total.max(1), rec.total.max(1));
-                            // Gerçek boyutu diskten al.
-                            if let Ok(m) = std::fs::metadata(&rec.dest) {
-                                let len = m.len();
-                                this.set_progress(&rec.id, len, len);
-                            }
-                            this.save();
-                            this.emit(UiEvent::Changed);
-                            this.emit(UiEvent::Toast(format!("İndi: {}", rec.dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())));
-                            break;
-                        }
-                        DownloadEvent::Cancelled => {
-                            this.set_progress(
-                                &rec.id,
-                                std::fs::metadata(rec.dest.with_extension("mp4.part")).map(|m| m.len()).unwrap_or(0),
-                                rec.total,
-                            );
-                            this.set_status(&rec.id, DownloadStatus::Paused);
-                            this.save();
-                            this.emit(UiEvent::Changed);
-                            break;
-                        }
-                        DownloadEvent::Error(e) => {
-                            this.set_status(&rec.id, DownloadStatus::Error(e.clone()));
-                            this.save();
-                            this.emit(UiEvent::Changed);
-                            this.emit(UiEvent::Toast(format!("İndirme hatası: {e}")));
-                            break;
-                        }
+                        this.save();
+                        this.emit(UiEvent::Changed);
+                        this.emit(UiEvent::Toast(format!("İndi: {}", rec.dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())));
+                        break;
+                    }
+                    DownloadEvent::Cancelled => {
+                        this.set_progress(
+                            &rec.id,
+                            std::fs::metadata(rec.dest.with_extension("mp4.part")).map(|m| m.len()).unwrap_or(0),
+                            rec.total,
+                        );
+                        this.set_status(&rec.id, DownloadStatus::Paused);
+                        this.save();
+                        this.emit(UiEvent::Changed);
+                        break;
+                    }
+                    DownloadEvent::Error(e) => {
+                        this.set_status(&rec.id, DownloadStatus::Error(e.clone()));
+                        this.save();
+                        this.emit(UiEvent::Changed);
+                        this.emit(UiEvent::Toast(format!("İndirme hatası: {e}")));
+                        break;
                     }
                 }
-                if let Ok(mut h) = this.inner.handles.lock() {
-                    h.remove(&rec.id);
-                }
             }
-            this.inner.worker_on.store(false, Ordering::SeqCst);
-            // Yarış: kuyruk kapanıştan sonra dolduysa yeniden başlat.
-            let pending = this
-                .inner
-                .queue
-                .lock()
-                .map(|q| q.iter().any(|r| matches!(r.status, DownloadStatus::Queued)))
-                .unwrap_or(false);
-            if pending {
-                this.ensure_worker();
+            if let Ok(mut h) = this.inner.handles.lock() {
+                h.remove(&rec.id);
             }
-        });
+        }
+        this.inner.active.fetch_sub(1, Ordering::SeqCst);
+        // Yarış: kuyruk kapanıştan sonra dolduysa yeniden başlat.
+        let pending = this
+            .inner
+            .queue
+            .lock()
+            .map(|q| q.iter().any(|r| matches!(r.status, DownloadStatus::Queued)))
+            .unwrap_or(false);
+        if pending {
+            this.ensure_worker();
+        }
     }
+}
+
+/// Kuyruktan ilk bekleyeni alıp İndiriliyor'a geçirir (atomik talep).
+fn this_claim(inner: &ManagerInner) -> Option<DownloadRecord> {
+    inner
+        .queue
+        .lock()
+        .map(|mut q| {
+            q.iter_mut()
+                .find(|r| matches!(r.status, DownloadStatus::Queued))
+                .map(|r| {
+                    r.status = DownloadStatus::Downloading;
+                    r.clone()
+                })
+        })
+        .unwrap_or(None)
 }
 
 #[cfg(test)]
@@ -890,6 +949,155 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Paralel-3 kanıtı: 8MB altı dosyalar tek-akış yolundan iner; 300ms
+    /// gecikmeli sunucu çakışmayı zorlar, sayaç eşzamanlılığı kanıtlar.
+    #[test]
+    fn parallel_three_small_files_all_done() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+
+        static LEN: usize = 128_000;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("dinle");
+        let port = listener.local_addr().unwrap().port();
+        let cur = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let (cur_c, max_c) = (cur.clone(), max_seen.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let (cc, mc) = (cur_c.clone(), max_c.clone());
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 4096];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let _req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let c = cc.fetch_add(1, O::SeqCst) + 1;
+                    mc.fetch_max(c, O::SeqCst);
+                    // Çakışma penceresi: başlıklar gecikir.
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let body = vec![0xCDu8; LEN];
+                    let _ = s.write_all(
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {LEN}\r\nConnection: close\r\n\r\n").as_bytes(),
+                    );
+                    let _ = s.write_all(&body);
+                    cc.fetch_sub(1, O::SeqCst);
+                });
+            }
+        });
+
+        let dir = std::env::temp_dir().join("animecix-dl-par3");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let m = DownloadManager::new(dir.join("q.json"), tx);
+        // Aria varsa daemonu önceden ısıt (yoksa Err yoksayılır): ilk işin
+        // daemon-startup kilidi 3 işi serileştirmesin, çakışma ölçülebilsin.
+        let _ = crate::aria::ensure_daemon();
+        m.set_max_parallel(3);
+        for id in ["a", "b", "c"] {
+            let dest = dir.join(format!("{id}.mp4"));
+            let mut rec = test_record(id, dest);
+            rec.url = format!("http://127.0.0.1:{port}/{id}.mp4");
+            m.enqueue(rec, true);
+        }
+        let t0 = std::time::Instant::now();
+        loop {
+            let snap = m.snapshot();
+            if snap.iter().all(|r| matches!(r.status, DownloadStatus::Done)) {
+                break;
+            }
+            assert!(
+                !snap.iter().any(|r| matches!(r.status, DownloadStatus::Error(_))),
+                "hata olmamalı: {snap:?}"
+            );
+            assert!(t0.elapsed() < std::time::Duration::from_secs(30), "takıldı: {snap:?}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        for id in ["a", "b", "c"] {
+            assert_eq!(
+                std::fs::metadata(dir.join(format!("{id}.mp4"))).unwrap().len(),
+                LEN as u64
+            );
+        }
+        assert!(
+            max_seen.load(O::SeqCst) >= 2,
+            "en az iki iş çakışmalı, max_seen={}",
+            max_seen.load(O::SeqCst)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tarpit kanıtı: başlık göndermeyen 2 yol + 1 hızlı yol. Beklenti:
+    /// hızlı Done, yavaşlar SONSUZA dek Bağlanıyor kalmaz (hata verir).
+    /// Yavaş sunucu 65sn sonra verse bile önce timeout/istemci hatası gelir.
+    #[test]
+    fn tarpit_two_stall_one_fast() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        static LEN: usize = 256_000;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("dinle");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 4096];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    if path.starts_with("/slow") {
+                        // Başlık göndermeden beklet (tarpit).
+                        std::thread::sleep(std::time::Duration::from_secs(65));
+                    }
+                    let body = vec![0xCEu8; LEN];
+                    let _ = s.write_all(
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {LEN}\r\nConnection: close\r\n\r\n").as_bytes(),
+                    );
+                    let _ = s.write_all(&body);
+                });
+            }
+        });
+
+        let dir = std::env::temp_dir().join("animecix-dl-tarpit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let m = DownloadManager::new(dir.join("q.json"), tx);
+        let _ = crate::aria::ensure_daemon();
+        m.set_max_parallel(3);
+        for id in ["fast", "slow1", "slow2"] {
+            let dest = dir.join(format!("{id}.mp4"));
+            let mut rec = test_record(id, dest);
+            rec.url = format!("http://127.0.0.1:{port}/{id}.mp4");
+            m.enqueue(rec, true);
+        }
+        let t0 = std::time::Instant::now();
+        loop {
+            let snap = m.snapshot();
+            let fast_done = snap.iter().any(|r| r.id == "fast" && matches!(r.status, DownloadStatus::Done));
+            let slows_gone = snap
+                .iter()
+                .filter(|r| r.id == "slow1" || r.id == "slow2")
+                .all(|r| matches!(r.status, DownloadStatus::Done | DownloadStatus::Error(_)));
+            if fast_done && slows_gone {
+                break;
+            }
+            // Yavaşlar Done OLMAMALI (65sn'ci sunucu 85sn sınırdan sonra cevap verir).
+            assert!(
+                !snap.iter().any(|r| (r.id == "slow1" || r.id == "slow2")
+                    && matches!(r.status, DownloadStatus::Done)),
+                "tarpit Done olmamalı (timeout çalışmıyor?): {snap:?}"
+            );
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(85),
+                "takıldı (sonsuz Bağlanıyor?): {snap:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Yerel mini sunucu: tam indirme + progress + resume (206) kanıtı.    #[test]
     fn download_full_and_resume_against_local_server() {
         use std::io::{Read, Write};
@@ -939,7 +1147,7 @@ mod tests {
 
         // 1) tam indirme.
         let (tx, rx) = mpsc::channel();
-        let _h = start_download(&url, None, &dest, tx);
+        let _h = start_download(&url, None, &dest, tx, 6);
         let mut last = (0u64, 0u64);
         let mut done = false;
         for ev in rx.iter() {
@@ -958,7 +1166,7 @@ mod tests {
         std::fs::remove_file(&dest).unwrap();
         std::fs::write(dest.with_extension("mp4.part"), vec![0xABu8; 100_000]).unwrap();
         let (tx2, rx2) = mpsc::channel();
-        let _h2 = start_download(&url, None, &dest, tx2);
+        let _h2 = start_download(&url, None, &dest, tx2, 6);
         let mut done2 = false;
         for ev in rx2.iter() {
             match ev {
@@ -1008,6 +1216,59 @@ mod tests {
         m.remove("a");
         assert!(m.snapshot().is_empty());
         assert!(!dest.with_extension("mp4.part").exists(), ".part silinmeli");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effective_segments_table() {
+        assert_eq!(effective_segments(0), 6);
+        assert_eq!(effective_segments(1), 6);
+        assert_eq!(effective_segments(2), 2);
+        assert_eq!(effective_segments(3), 2);
+        assert_eq!(effective_segments(4), 1);
+        assert_eq!(effective_segments(32), 1);
+    }
+
+    #[test]
+    fn max_parallel_clamps_and_defaults() {
+        let dir = std::env::temp_dir().join("animecix-dl-par");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let m = DownloadManager::new(dir.join("q.json"), tx);
+        assert_eq!(m.max_parallel(), 1, "varsayılan tek işçi");
+        m.set_max_parallel(0);
+        assert_eq!(m.max_parallel(), 1, "0 bire kelepçelenir");
+        m.set_max_parallel(99);
+        assert_eq!(m.max_parallel(), 32, "99 otuza kelepçelenir");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parallel_admission_starts_two_at_once() {
+        // 127.0.0.1:9 anında reddedilir; iki işçi de kuyruktan çıkmalı.
+        let dir = std::env::temp_dir().join("animecix-dl-par2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let m = DownloadManager::new(dir.join("q.json"), tx);
+        m.set_max_parallel(2);
+        m.enqueue(test_record("a", dir.join("a.mp4")), true);
+        m.enqueue(test_record("b", dir.join("b.mp4")), true);
+        m.enqueue(test_record("c", dir.join("c.mp4")), true);
+        let t0 = std::time::Instant::now();
+        loop {
+            let admitted = m
+                .snapshot()
+                .iter()
+                .filter(|r| !matches!(r.status, DownloadStatus::Queued))
+                .count();
+            if admitted >= 2 || t0.elapsed() > std::time::Duration::from_secs(10) {
+                assert!(admitted >= 2, "iki iş aynı anda başlamalı, admitted={admitted}");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

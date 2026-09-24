@@ -355,6 +355,12 @@ pub struct Settings {
     pub light_mode: bool,
     #[serde(default = "default_patience")]
     pub source_patience_secs: u64,
+    /// Aynı anda indirilen bölüm sayısı (1-32, varsayılan 1).
+    #[serde(default = "default_max_parallel")]
+    pub max_parallel_downloads: u64,
+    /// Listeden silme ipucu gösterildi mi (bir kez, 10sn toast).
+    #[serde(default)]
+    pub seen_remove_hint: bool,
     #[serde(default)]
     pub default_fansub_template: Option<i64>,
     #[serde(default = "default_true")]
@@ -395,6 +401,7 @@ fn default_tools_shortcut() -> String { "Ctrl+T".into() }
 fn default_true() -> bool { true }
 fn default_upscale() -> String { "hafif".into() }
 fn default_patience() -> u64 { 20 }
+fn default_max_parallel() -> u64 { 1 }
 fn default_ui_scale() -> f32 { 1.0 }
 fn default_theme() -> String { "koyu".into() }
 fn default_cover_quality() -> String { "orta".into() }
@@ -778,6 +785,8 @@ impl Default for Settings {
             upscale: default_upscale(),
             light_mode: false,
             source_patience_secs: default_patience(),
+            max_parallel_downloads: default_max_parallel(),
+            seen_remove_hint: false,
             default_fansub_template: None,
             fansub_ask_each_time: true,
             ui_scale: default_ui_scale(),
@@ -3244,6 +3253,26 @@ mod tests {
         assert!(json.contains("source_patience_secs"), "alan JSON'da olmalı");
         let back: Settings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.source_patience_secs, 40, "sabır korunmalı");
+    }
+
+    #[test]
+    fn settings_max_parallel_roundtrips() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.max_parallel_downloads, 1, "eski ayar dosyası 1'e düşmeli");
+        let mut s = Settings::default();
+        assert_eq!(s.max_parallel_downloads, 1);
+        s.max_parallel_downloads = 4;
+        let json = serde_json::to_string_pretty(&s).expect("serialize");
+        assert!(json.contains("max_parallel_downloads"), "alan JSON'da olmalı");
+        let back: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.max_parallel_downloads, 4, "paralellik korunmalı");
+    }
+
+    #[test]
+    fn settings_remove_hint_once_by_default() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!old.seen_remove_hint, "eski ayar dosyasında ipucu görülmemiş sayılır");
+        assert!(!Settings::default().seen_remove_hint);
     }
 
     fn migrate_state_recovers_bare_id_and_alias_fields() {

@@ -62,11 +62,24 @@ struct Daemon {
 }
 
 static DAEMON: OnceLock<Mutex<Option<Daemon>>> = OnceLock::new();
+/// Daemon açma tekilleştirme kilidi: eşzamanlı çağrılar tek daemon açar,
+/// kaybeden kazananı yeniden kullanır (thundering-herd + kill-steal yok).
+static SPAWN: OnceLock<Mutex<()>> = OnceLock::new();
 /// Aktif aria indirme sayacı (0'a düşünce daemon kapatılır, yetim kalmaz).
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 fn daemon_slot() -> &'static Mutex<Option<Daemon>> {
     DAEMON.get_or_init(|| Mutex::new(None))
+}
+
+fn spawn_lock() -> &'static Mutex<()> {
+    SPAWN.get_or_init(|| Mutex::new(()))
+}
+
+/// Ölü/zombi çocuk biçer (kill + wait; beklemeyen ebeveyn zombi bırakır).
+fn reap_child(mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// JSON-RPC gövdesi kurar (saf; test edilir).
@@ -102,12 +115,22 @@ fn rpc_call(port: u16, secret: &str, method: &str, params: serde_json::Value) ->
         .ok_or_else(|| "rpc sonuçsuz".to_string())
 }
 
+/// Aria iş-seviyesi boşta-zaman aşımı (sn): ilk bayt/ilerleme gelmezse
+/// iş hata ile kapatılır, slot iade edilir. Daemon-varsayılan sonsuz
+/// retry/poll döngüsünü keser. Saf karar fn test edilir.
+pub const ARIA_IDLE_TIMEOUT_SECS: u64 = 60;
+
+pub fn aria_idle_expired(last_progress: std::time::Instant, now: std::time::Instant) -> bool {
+    now.duration_since(last_progress).as_secs() >= ARIA_IDLE_TIMEOUT_SECS
+}
+
 /// addUri seçenekleri kurar (saf; test edilir).
 pub fn add_uri_options(
     dir: &str,
     out: &str,
     ua: &str,
     referer: Option<&str>,
+    split: u32,
 ) -> serde_json::Value {
     let mut headers = vec![format!("User-Agent: {ua}")];
     if let Some(r) = referer {
@@ -117,20 +140,36 @@ pub fn add_uri_options(
         "dir": dir,
         "out": out,
         "header": headers,
-        "split": SEGMENTS,
-        "max-connection-per-server": SEGMENTS,
+        "split": split.max(1),
+        "max-connection-per-server": split.max(1),
         "min-split-size": "1M",
         "continue": true,
         "check-certificate": true,
     })
 }
 
-/// Daemon hazırsa (port, secret) döner; yoksa başlatır.
+/// Daemon hazırsa (port, secret) döner; yoksa TEK ejempler başlatır.
+/// Eşzamanlı çağrılar serilenir; ilk bitirenin daemonu herkesçe kullanılır.
 pub fn ensure_daemon() -> Result<(u16, String), String> {
+    // Tekilleştirme muhafızı fonksiyon boyunca tutulur (zehirde muhafızsız devam).
+    let _spawn_guard = spawn_lock().lock().ok();
+    // Kazanan çoktan açmış olabilir: önce yuvaya bak.
     if let Ok(g) = daemon_slot().lock() {
         if let Some(d) = g.as_ref() {
             if rpc_call(d.port, &d.secret, "aria2.getVersion", serde_json::json!([])).is_ok() {
                 return Ok((d.port, d.secret.clone()));
+            }
+        }
+    }
+    // Ölü kayıt varsa biç (yenisi açılmadan önce port boşa çıksın).
+    if let Ok(mut g) = daemon_slot().lock() {
+        if let Some(d) = g.take() {
+            if rpc_call(d.port, &d.secret, "aria2.getVersion", serde_json::json!([])).is_err() {
+                reap_child(d.child);
+            } else {
+                let (port, secret) = (d.port, d.secret.clone());
+                *g = Some(d);
+                return Ok((port, secret));
             }
         }
     }
@@ -148,6 +187,13 @@ pub fn ensure_daemon() -> Result<(u16, String), String> {
             &format!("-x{}", SEGMENTS),
             &format!("-s{}", SEGMENTS),
             "-k1M",
+            // Paralel dosya indirme: daemon varsayılanı (5) N işçiyi kısmasın.
+            "--max-concurrent-downloads=32",
+            // Sonsuz bekleme yok: yanıt vermeyen sunucu hata versin.
+            "--connect-timeout=10",
+            "--timeout=30",
+            "--retry-wait=2",
+            "--max-tries=5",
             "--console-log-level=warn",
             "--quiet=true",
         ]);
@@ -171,26 +217,23 @@ pub fn ensure_daemon() -> Result<(u16, String), String> {
             }
             return Ok((port, secret));
         }
-        let _ = daemon_slot()
-            .lock()
-            .map(|mut g| g.take().map(|mut d| d.child.kill()));
+        // Bu porta yerleşemedi (dolu/ölü): KENDİ çocuğumuzu biç, yuvaya dokunma.
+        reap_child(child);
     }
     Err("aria2 RPC hazır olmadı".to_string())
 }
 
-/// Boştaki daemonu kapatır (yetim süreç kalmaz).
+/// Boştaki daemonu kapatır (yetim süreç kalmaz). Kilit yalnızca
+/// take için tutulur; RPC/kill/wait kilitsiz yapılır.
 fn maybe_shutdown() {
     if ACTIVE.load(Ordering::SeqCst) != 0 {
         return;
     }
-    if let Ok(mut g) = daemon_slot().lock() {
-        if let Some(d) = g.take() {
-            let _ = rpc_call(d.port, &d.secret, "aria2.shutdown", serde_json::json!([]));
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            let mut d = d;
-            let _ = d.child.kill();
-            let _ = d.child.wait();
-        }
+    let taken = daemon_slot().lock().map(|mut g| g.take()).unwrap_or(None);
+    if let Some(d) = taken {
+        let _ = rpc_call(d.port, &d.secret, "aria2.shutdown", serde_json::json!([]));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        reap_child(d.child);
     }
 }
 
@@ -208,8 +251,9 @@ pub fn add_uri(
     out: &str,
     ua: &str,
     referer: Option<&str>,
+    split: u32,
 ) -> Result<String, String> {
-    let opts = add_uri_options(dir, out, ua, referer);
+    let opts = add_uri_options(dir, out, ua, referer, split);
     let res = rpc_call(
         port,
         secret,
@@ -281,6 +325,7 @@ pub fn start_download_aria(
     referer: Option<&str>,
     dest_final: &Path,
     tx: mpsc::Sender<crate::download::DownloadEvent>,
+    split: u32,
 ) -> crate::download::DownloadHandle {
     use crate::download::DownloadEvent;
     let cancel = Arc::new(AtomicBool::new(false));
@@ -310,7 +355,7 @@ pub fn start_download_aria(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "video.mp4".to_string());
-        let gid = match add_uri(port, &secret, &url, &dir, &out, UA, referer.as_deref()) {
+        let gid = match add_uri(port, &secret, &url, &dir, &out, UA, referer.as_deref(), split.max(1)) {
             Ok(g) => g,
             Err(e) => {
                 let _ = tx.send(DownloadEvent::Error(format!("aria2 kuyruk: {e}")));
@@ -323,6 +368,8 @@ pub fn start_download_aria(
         if have0 > 0 {
             let _ = tx.send(DownloadEvent::Progress(have0, have0));
         }
+        // Son ilerleme anı: ilk bayt gelmezse zaman aşımı işletilir.
+        let mut last_progress = std::time::Instant::now();
         loop {
             if cancel_r.load(Ordering::Relaxed) {
                 let _ = remove_gid(port, &secret, &gid);
@@ -357,6 +404,19 @@ pub fn start_download_aria(
                     }
                     _ => {
                         // active | waiting | paused
+                        if st.completed > 0 || st.total > 0 {
+                            last_progress = std::time::Instant::now();
+                        }
+                        if aria_idle_expired(last_progress, std::time::Instant::now()) {
+                            // Sunucu yanıt vermiyor: slotu iade et, hata ver.
+                            let _ = remove_gid(port, &secret, &gid);
+                            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+                            maybe_shutdown();
+                            let _ = tx.send(DownloadEvent::Error(format!(
+                                "zaman aşımı: sunucu {ARIA_IDLE_TIMEOUT_SECS}sn yanıt vermedi"
+                            )));
+                            return;
+                        }
                         let _ = tx.send(DownloadEvent::Progress(st.completed, st.total));
                     }
                 },
@@ -387,12 +447,22 @@ mod tests {
     }
 
     #[test]
+    fn aria_idle_timeout_decision() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        assert!(!aria_idle_expired(t0, t0), "sıfır geçen süre aşmamalı");
+        assert!(!aria_idle_expired(t0, t0 + Duration::from_secs(ARIA_IDLE_TIMEOUT_SECS - 1)));
+        assert!(aria_idle_expired(t0, t0 + Duration::from_secs(ARIA_IDLE_TIMEOUT_SECS)));
+        assert!(aria_idle_expired(t0, t0 + Duration::from_secs(ARIA_IDLE_TIMEOUT_SECS + 30)));
+    }
+
+    #[test]
     fn add_uri_options_shapes() {
-        let o = add_uri_options("/tmp/x", "v.mp4", "UA-Test", Some("http://ref/"));
+        let o = add_uri_options("/tmp/x", "v.mp4", "UA-Test", Some("http://ref/"), 3);
         assert_eq!(o["dir"], "/tmp/x");
         assert_eq!(o["out"], "v.mp4");
-        assert_eq!(o["split"], SEGMENTS);
-        assert_eq!(o["max-connection-per-server"], SEGMENTS);
+        assert_eq!(o["split"], 3);
+        assert_eq!(o["max-connection-per-server"], 3);
         assert_eq!(o["min-split-size"], "1M");
         assert_eq!(o["continue"], true);
         let hdrs: Vec<String> = o["header"]
@@ -462,7 +532,7 @@ mod tests {
         let dest = dir.join("v.mp4");
         let url = format!("http://127.0.0.1:{port}/v.mp4");
         let (tx, rx) = mpsc::channel();
-        let _h = start_download_aria(&url, None, &dest, tx);
+        let _h = start_download_aria(&url, None, &dest, tx, 6);
         let mut done = false;
         for ev in rx.iter() {
             match ev {

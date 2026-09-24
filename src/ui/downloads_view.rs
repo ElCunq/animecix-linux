@@ -3,6 +3,7 @@
 use gtk::prelude::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use crate::download::{DownloadManager, DownloadRecord, DownloadStatus};
 
@@ -59,7 +60,7 @@ impl DownloadsView {
             DownloadStatus::Queued if rec.have == 0 => (
                 0.0,
                 "Bekleniyor".to_string(),
-                "Sırada — sırayla indiriliyor".to_string(),
+                "Sırada".to_string(),
             ),
             DownloadStatus::Queued => {
                 let p = pct(rec.have, rec.total);
@@ -73,9 +74,15 @@ impl DownloadsView {
                     ),
                 )
             }
-            DownloadStatus::Downloading if rec.total == 0 => {
+            DownloadStatus::Downloading if rec.total == 0 && rec.have == 0 => {
                 (0.0, "%0".to_string(), "Bağlanıyor…".to_string())
             }
+            DownloadStatus::Downloading if rec.total == 0 => (
+                // Uzunluk bilinmiyor ama bayt akıyor: bağlanıldı, iniyor.
+                0.0,
+                "%?".to_string(),
+                format!("İndiriliyor — {} / ?", crate::download::fmt_bytes(rec.have)),
+            ),
             _ => {
                 let p = pct(rec.have, rec.total);
                 (
@@ -129,6 +136,7 @@ impl DownloadsView {
         status: &gtk::Label,
         rec: &DownloadRecord,
         manager: &DownloadManager,
+        on_remove: &Rc<dyn Fn()>,
     ) {
         while let Some(c) = foot.first_child() {
             foot.remove(&c);
@@ -164,18 +172,27 @@ impl DownloadsView {
         let rm = Self::icon_btn("user-trash-symbolic", "Kaldır");
         let m = manager.clone();
         let id = rec.id.clone();
-        rm.connect_clicked(move |_| m.remove(&id));
+        let on_rm = on_remove.clone();
+        rm.connect_clicked(move |_| {
+            m.remove(&id);
+            on_rm();
+        });
         foot.append(&rm);
     }
 
     /// Mevcut satırı yerinde tazeler (bar/etiket/başlık/buton; yeniden kurulum yok).
-    pub fn refresh_row(row: &DlRow, rec: &DownloadRecord, manager: &DownloadManager) {
+    pub fn refresh_row(
+        row: &DlRow,
+        rec: &DownloadRecord,
+        manager: &DownloadManager,
+        on_remove: &Rc<dyn Fn()>,
+    ) {
         row.title.set_text(&Self::row_title(rec));
         let (frac, txt, stxt) = Self::row_state(rec);
         row.bar.set_fraction(frac);
         row.bar.set_text(Some(&txt));
         row.status.set_text(&stxt);
-        Self::fill_foot(&row.foot, &row.status, rec, manager);
+        Self::fill_foot(&row.foot, &row.status, rec, manager, on_remove);
     }
 
     /// Sayfayı kurar; ilerleme Tick'lerinde + yapısal pompa güncellemelerinde
@@ -183,6 +200,7 @@ impl DownloadsView {
     pub fn build(
         manager: &DownloadManager,
         open_dir: PathBuf,
+        on_remove: Rc<dyn Fn()>,
     ) -> (gtk::ScrolledWindow, HashMap<String, DlRow>) {
         let mut rows: HashMap<String, DlRow> = HashMap::new();
         let scroll = gtk::ScrolledWindow::new();
@@ -197,6 +215,23 @@ impl DownloadsView {
                 "Bölüm sayfasındaki indir düğmesiyle eklediğin bölümler burada görünür.",
                 "folder-download-symbolic",
             );
+            // Boşken de klasöre erişim: açıklamanın altında hap buton.
+            // (Dolu görünümde sağ üstteki Klasör Aç yeterli.)
+            // NOT: with_label + set_icon_name etiketi siler; ikon+yazı için
+            // birleşik çocuk gerekir.
+            let open_btn = gtk::Button::new();
+            open_btn.add_css_class("suggested-action");
+            open_btn.add_css_class("pill");
+            let open_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            open_box.append(&gtk::Image::from_icon_name("folder-open-symbolic"));
+            open_box.append(&gtk::Label::new(Some("İndirilenleri Aç")));
+            open_btn.set_child(Some(&open_box));
+            open_btn.set_halign(gtk::Align::Center);
+            let open_dir_c = open_dir.clone();
+            open_btn.connect_clicked(move |_| {
+                let _ = std::process::Command::new("xdg-open").arg(&open_dir_c).spawn();
+            });
+            sp.set_child(Some(&open_btn));
             scroll.set_child(Some(&sp));
             return (scroll, rows);
         }
@@ -218,10 +253,13 @@ impl DownloadsView {
         search.set_hexpand(true);
         search.set_valign(gtk::Align::Center);
         head.append(&search);
-        let open_btn = gtk::Button::with_label("Klasör Aç");
-        open_btn.set_icon_name("folder-open-symbolic");
+        let open_btn = gtk::Button::new();
         open_btn.add_css_class("flat");
         open_btn.add_css_class("pill");
+        let open_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        open_box.append(&gtk::Image::from_icon_name("folder-open-symbolic"));
+        open_box.append(&gtk::Label::new(Some("Klasör Aç")));
+        open_btn.set_child(Some(&open_box));
         open_btn.set_valign(gtk::Align::Center);
         open_btn.connect_clicked(move |_| {
             let _ = std::process::Command::new("xdg-open").arg(&open_dir).spawn();
@@ -267,7 +305,7 @@ impl DownloadsView {
             status.set_xalign(0.0);
             status.set_hexpand(true);
             status.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            Self::fill_foot(&foot, &status, &rec, manager);
+            Self::fill_foot(&foot, &status, &rec, manager, &on_remove);
             card.append(&foot);
 
             let filter = Self::filter_text(&rec);
@@ -391,7 +429,7 @@ mod tests {
         let (f, bar, st) = DownloadsView::row_state(&rec(DownloadStatus::Queued, 0, 0, "", "", ""));
         assert_eq!(f, 0.0);
         assert_eq!(bar, "Bekleniyor");
-        assert_eq!(st, "Sırada — sırayla indiriliyor");
+        assert_eq!(st, "Sırada");
 
         let (_, bar, st) = DownloadsView::row_state(&rec(DownloadStatus::Queued, 30, 100, "", "", ""));
         assert_eq!(bar, "%30");
@@ -400,6 +438,10 @@ mod tests {
         let (_, bar, st) =
             DownloadsView::row_state(&rec(DownloadStatus::Downloading, 0, 0, "", "", ""));
         assert_eq!((bar.as_str(), st.as_str()), ("%0", "Bağlanıyor…"));
+
+        let (_, bar, st) =
+            DownloadsView::row_state(&rec(DownloadStatus::Downloading, 1536, 0, "", "", ""));
+        assert_eq!((bar.as_str(), st.as_str()), ("%?", "İndiriliyor — 1.5 KB / ?"));
 
         let (f, bar, st) =
             DownloadsView::row_state(&rec(DownloadStatus::Downloading, 1536, 3072, "", "", ""));

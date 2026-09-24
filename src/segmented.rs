@@ -117,13 +117,16 @@ pub fn download_segmented(
     }
     let done_sum = Arc::new(AtomicU64::new(0));
     let first_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let record_fail = Arc::new(|msg: String| {
-        if let Ok(mut g) = first_err.lock() {
+    let failed = Arc::new(AtomicBool::new(false));
+    let first_err_c = first_err.clone();
+    let failed_c = failed.clone();
+    let record_fail = Arc::new(move |msg: String| {
+        if let Ok(mut g) = first_err_c.lock() {
             if g.is_none() {
                 *g = Some(msg);
             }
         }
-        cancel.store(true, Ordering::Relaxed);
+        failed_c.store(true, Ordering::Relaxed);
     });
 
     std::thread::scope(|s| {
@@ -131,6 +134,7 @@ pub fn download_segmented(
             let seg_len = end - start + 1;
             let done_sum_c = done_sum.clone();
             let fail = record_fail.clone();
+            let failed_i = failed.clone();
             s.spawn(move || {
                 let mut req = client
                     .get(url)
@@ -180,7 +184,7 @@ pub fn download_segmented(
                 let mut written: u64 = 0;
                 let mut since_report: u64 = 0;
                 loop {
-                    if cancel.load(Ordering::Relaxed) {
+                    if cancel.load(Ordering::Relaxed) || failed_i.load(Ordering::Relaxed) {
                         return;
                     }
                     match resp.read(&mut buf) {
@@ -216,7 +220,7 @@ pub fn download_segmented(
         }
     });
 
-    if cancel.load(Ordering::Relaxed) {
+    if failed.load(Ordering::Relaxed) {
         if let Ok(g) = first_err.lock() {
             if let Some(e) = g.as_ref() {
                 if !e.is_empty() {
@@ -224,6 +228,9 @@ pub fn download_segmented(
                 }
             }
         }
+        return Err("segment hatası".to_string());
+    }
+    if cancel.load(Ordering::Relaxed) {
         return Err("iptal".to_string());
     }
     progress(total, total);
