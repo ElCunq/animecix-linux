@@ -5,7 +5,7 @@ pub mod fansub_dialog;
 pub mod flashcard;
 pub mod downloads_view;
 pub mod welcome;
-pub mod tools_menu;
 pub mod brand_icons;
 pub mod row_menu;
 pub mod play_quality_dialog;
+pub mod shortcuts;

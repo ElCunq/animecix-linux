@@ -138,6 +138,68 @@ if [ -f "$ICON_SRC" ]; then
     cp "$ICON_SRC" "$APPDIR/.DirIcon"
 fi
 
+# 4b. Adwaita symbolic ikonları standart hicolor konumuna kopyala
+# (XDG_DATA_DIRS üzerinden bulunur; CC-BY-SA atıf dosyasıyla birlikte).
+if [ -d "assets/hicolor/scalable/actions" ]; then
+    mkdir -p "$APPDIR/usr/share/icons/hicolor/scalable/actions"
+    cp assets/hicolor/scalable/actions/*.svg "$APPDIR/usr/share/icons/hicolor/scalable/actions/"
+    mkdir -p "$APPDIR/usr/share/doc/animecix"
+    cp assets/ATTRIBUTION-Adwaita.md "$APPDIR/usr/share/doc/animecix/" 2>/dev/null || true
+    if [ -f "assets/hicolor/index.theme" ]; then
+        cp assets/hicolor/index.theme "$APPDIR/usr/share/icons/hicolor/index.theme"
+    else
+        # Tema dosyası yoksa GTK klasörü tema saymazdı; sessiz geçme, üret.
+        cat > "$APPDIR/usr/share/icons/hicolor/index.theme" <<'THEME'
+[Icon Theme]
+Name=hicolor
+Comment=Fallback icon theme
+Directories=256x256/apps,512x512/apps,scalable/actions
+Version=1.0
+
+[256x256/apps]
+Size=256
+Context=Applications
+Type=Fixed
+
+[512x512/apps]
+Size=512
+Context=Applications
+Type=Fixed
+
+[scalable/actions]
+Size=16
+Context=Actions
+Type=Scalable
+MinSize=8
+MaxSize=512
+THEME
+        echo "==> UYARI: assets/hicolor/index.theme yoktu, AppDir için üretildi."
+    fi
+fi
+
+# 4c. Adwaita tema görünümü: aynı GitHub SVG'ler `Adwaita/symbolic/actions`
+# diziliminde de sunulur (sistem dizilimiyle aynı: Adwaita/*.svg oradadır).
+# Uygulama temayı Adwaita'ya sabitler (main.rs); GTK önce aktif temayı
+# aradığından breeze/Yaru altındaki sistem çizimleri ezilemez.
+if [ -d "assets/hicolor/scalable/actions" ]; then
+    mkdir -p "$APPDIR/usr/share/icons/Adwaita/symbolic/actions"
+    cp assets/hicolor/scalable/actions/*.svg "$APPDIR/usr/share/icons/Adwaita/symbolic/actions/"
+    cat > "$APPDIR/usr/share/icons/Adwaita/index.theme" <<'THEME'
+[Icon Theme]
+Name=Adwaita
+Comment=AnimeciX gomulu Adwaita (GitHub master, CC-BY-SA; atif: usr/share/doc/animecix/)
+Directories=symbolic/actions
+Version=1.0
+
+[symbolic/actions]
+Size=16
+Context=Actions
+Type=Scalable
+MinSize=8
+MaxSize=512
+THEME
+fi
+
 # 5. .desktop dosyası oluştur
 cat > "$APPDIR/tr.com.animecix.desktop" <<EOF
 [Desktop Entry]
@@ -150,7 +212,7 @@ Terminal=false
 Categories=AudioVideo;Video;Network;
 X-AppImage-Version=$VERSION
 EOF
-cp "$APPDIR/tr.com.animecix.desktop" "$APPDIR/animecix.desktop"
+# NOT: Tek .desktop dosyası (katalog testi "multiple desktop files" diye patlar).
 
 # 5b. aria2c + kütüphaneleri (6 bağlantılı indirme; glibc çekirdeği hariç).
 if command -v aria2c >/dev/null 2>&1; then

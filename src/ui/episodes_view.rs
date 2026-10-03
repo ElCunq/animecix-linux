@@ -64,12 +64,23 @@ pub fn create_title_detail_header(
     name_row.append(download_btn);
     info_box.append(&name_row);
 
+    // Puan hapı (Lowell uyarlaması): TMDB puanı varsa ismin altında.
+    if let Some(r) = title.rating {
+        let pill = gtk::Label::new(Some(&format!("★ {r:.1}")));
+        pill.add_css_class("rating-pill");
+        pill.set_xalign(0.0);
+        info_box.append(&pill);
+    }
+
     if let Some(genre) = title.genre_line() {
         let genre_lbl = gtk::Label::new(Some(&genre));
         genre_lbl.add_css_class("dim-label");
         genre_lbl.add_css_class("title-4");
         genre_lbl.set_xalign(0.0);
-        genre_lbl.set_wrap(true);
+        genre_lbl.set_wrap(false);
+        genre_lbl.set_single_line_mode(true);
+        genre_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        genre_lbl.set_tooltip_text(Some(&genre));
         info_box.append(&genre_lbl);
     }
 
@@ -202,7 +213,10 @@ pub fn create_movie_detail_view(
         genre_lbl.set_xalign(0.5);
         genre_lbl.set_halign(gtk::Align::Center);
         genre_lbl.set_justify(gtk::Justification::Center);
-        genre_lbl.set_wrap(true);
+        genre_lbl.set_wrap(false);
+        genre_lbl.set_single_line_mode(true);
+        genre_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        genre_lbl.set_tooltip_text(Some(&genre));
         genre_lbl.set_margin_start(24);
         genre_lbl.set_margin_end(24);
         root.append(&genre_lbl);

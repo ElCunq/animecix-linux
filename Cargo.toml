@@ -1,6 +1,6 @@
 [package]
 name = "animecix"
-version = "1.2.5"
+version = "1.2.6"
 edition = "2021"
 description = "Türkçe anime izleme uygulaması (GTK4/libadwaita + mpv)"
 homepage = "https://github.com/veilzon/animecix-linux"
@@ -15,7 +15,6 @@ gio = "0.19"
 gdk-pixbuf = "0.19"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-zstd = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "stream", "rustls-tls"] }
 wreq = "=6.0.0-rc.31"
 wreq-util = "=3.0.0-rc.14"
@@ -25,6 +24,10 @@ libc = "0.2.189"
 hmac = "0.12"
 sha2 = "0.10"
 aes-gcm = "0.10"
+ring = "0.17"
+base64 = "0.22"
 
 [profile.release]
 lto = true
+strip = true
+debug = false

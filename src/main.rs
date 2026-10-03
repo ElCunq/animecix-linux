@@ -53,6 +53,9 @@ fn main() {
     if raw_args.iter().any(|a| a == "--check-shaders") {
         return cmd_check_shaders();
     }
+    if raw_args.iter().any(|a| a == "--check-icons") {
+        return cmd_check_icons();
+    }
     let mut filtered: Vec<String> = Vec::new();
     let mut it = raw_args.iter();
     if let Some(p) = it.next() {
@@ -68,7 +71,13 @@ fn main() {
     }
 
     std::env::set_var("MALLOC_ARENA_MAX", "2");
-    let light_mode = api::Client::new().load_settings().light_mode;
+    // Hafif mod bayrağı: tüm Client kurmadan doğrudan ayar dosyasından
+    // okunur (Client::new HTTP/runtime kurar, açılışı yavaşlatır).
+    let light_mode = std::fs::read_to_string(api::Client::settings_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("light_mode").and_then(|b| b.as_bool()))
+        .unwrap_or(false);
     if light_mode {
         std::env::set_var("GSK_RENDERER", "cairo");
         eprintln!("[STARTUP] hafif mod aktif (cairo renderer)");
@@ -94,8 +103,32 @@ fn main() {
             }
 
             let theme = gtk::IconTheme::for_display(&display);
-            theme.add_search_path(base.join("assets"));
-            theme.add_search_path(base.join("usr/share/icons"));
+            // Gömülü Adwaita öncelikli: ours-önce + set_search_path
+            // (add_search_path sona eklerdi; ~/.local + /usr/share/Adwaita
+            // kazanır, gemideki 58 GitHub SVG hiç seçilmezdi).
+            // Sıra: önce AppImage düzeni, sonra `cargo run` kökleri.
+            {
+                let mut ours: Vec<std::path::PathBuf> = vec![
+                    base.join("usr/share/icons"),
+                    base.join("usr/share/animecix/assets/hicolor"),
+                    base.join("usr/share/animecix/assets"),
+                    base.join("assets/hicolor"),
+                    base.join("assets"),
+                ];
+                // `cargo run`: exe `target/debug/` altında, assetler repo kökünde.
+                if let Some(root) = base.ancestors().nth(2) {
+                    ours.push(root.join("assets/hicolor"));
+                    ours.push(root.join("assets"));
+                }
+                crate::prepend_icon_paths(&theme, &ours);
+                // Kilit: tema Adwaita'ya sabitlenir. GTK önce AKTİF temayı
+                // arar (breeze-dark'ta sistem kazanırdı); hicolor yedekliği
+                // yetmezdi. Display singleton'unda set_theme_name yasak
+                // olduğundan ayar üzerinden yapılır. Gömülü Adwaita dizini
+                // search-path'in önünde olduğundan GitHub çizimleri seçilir
+                // (CC-BY-SA, atıf gemide).
+                gtk::Settings::for_display(&display).set_gtk_icon_theme_name(Some("Adwaita"));
+            }
 
             let css = gtk::CssProvider::new();
             css.load_from_data(
@@ -173,6 +206,57 @@ fn main() {
                     transform: scale(0.97);
                 }
 
+                /* === Yan menü satırları (Lowell137/animecix-linux, MIT birebir) === */
+                .side-row {
+                    border-radius: 10px;
+                    font-weight: 450;
+                }
+                .side-row label {
+                    font-weight: 450;
+                }
+                .side-selected {
+                    background-color: alpha(currentColor, 0.13);
+                }
+                /* === Daraltılmış sidebar satırları: dolguyu sıfırla === */
+                .side-dock {
+                    min-width: 0px;
+                    padding-left: 2px;
+                    padding-right: 2px;
+                    padding-top: 4px;
+                    padding-bottom: 4px;
+                }
+
+                /* === Poster-lift: hoverda yazılar sabit, sadece poster kalkar
+                       (Lowell137/animecix-linux, MIT lisanslı uyarlama) === */
+                .poster-lift {
+                    transition: transform 140ms ease;
+                }
+                .poster-lift.lifted {
+                    transform: translateY(-3px);
+                }
+
+                /* === Spotlight hero (Lowell137/animecix-linux, MIT birebir) === */
+                .hero-clip {
+                    border-radius: 18px;
+                }
+                .hero-clip > picture {
+                    border-radius: 18px;
+                }
+                .hero-shade {
+                    background: linear-gradient(to top, rgba(0,0,0,0.92), rgba(0,0,0,0.55) 55%, rgba(0,0,0,0.15) 80%, rgba(0,0,0,0.0));
+                    border-radius: 0 0 18px 18px;
+                    padding: 14px 20px 16px 20px;
+                }
+                .hero-text {
+                    color: white;
+                    text-shadow: 0 1px 4px alpha(black, 0.9);
+                }
+                .hero-genre {
+                    color: #f5a524;
+                    font-weight: bold;
+                    text-shadow: 0 1px 3px alpha(black, 0.9);
+                }
+
                 /* === Dizi Detay Kartı === */
                 .title-detail-card {
                     background-color: alpha(currentColor, 0.04);
@@ -192,8 +276,17 @@ fn main() {
                     font-size: 0.85em;
                 }
 
-                /* === Tek Seferlik İpucu Kartı === */
-                .tip-banner {
+                /* === Puan hapı (Lowell137/animecix-linux, MIT uyarlaması) === */
+                .rating-pill {
+                    background-color: alpha(#f5c211, 0.16);
+                    border: 1px solid alpha(#f5c211, 0.4);
+                    border-radius: 999px;
+                    padding: 3px 12px;
+                    color: #f5c211;
+                    font-weight: bold;
+                }
+
+                /* === Tek Seferlik İpucu Kartı === */                .tip-banner {
                     background-color: alpha(@accent_color, 0.1);
                     border: 1px solid alpha(@accent_color, 0.28);
                     border-radius: 10px;
@@ -237,9 +330,10 @@ fn main() {
                     text-shadow: 0 1px 4px alpha(black, 0.85);
                 }
 
-                /* === Arayüz Ölçeği (Ayarlar > Görünüm) === */
-                .ui-scale-125 { font-size: 20px; }
-                .ui-scale-150 { font-size: 24px; }
+                /* === Haber gövde boyu (Ayarlar > Görünüm) === */
+                label.news-font-small { font-size: 0.9em; }
+                label.news-font-normal { font-size: 1.0em; }
+                label.news-font-large { font-size: 1.2em; line-height: 1.6; }
 
                 /* === Dikey Film Sayfası === */
                 .movie-big {
@@ -318,6 +412,32 @@ fn main() {
                     background-image: none;
                     border: none;
                     box-shadow: none;
+                }
+
+                /* === Hero skeleton: veri gelene kadar nabız iskelet === */
+                .hero-skeleton {
+                    background-color: alpha(currentColor, 0.08);
+                    border-radius: 18px;
+                    animation: hero-pulse 1.2s ease-in-out infinite alternate;
+                }
+                @keyframes hero-pulse {
+                    from { opacity: 0.45; }
+                    to { opacity: 1.0; }
+                }
+
+                /* === Headbar hızlı arama hapı (Lowell hızlı-hap tokenleri:
+                       999px kapsül + düşük opak zemin; odakta belirginleşir) === */
+                entry.header-search {
+                    border-radius: 9999px;
+                    min-width: 240px;
+                    min-height: 34px;
+                    padding: 4px 16px;
+                    background-color: rgba(20, 20, 28, 0.55);
+                    border: 1px solid alpha(currentColor, 0.12);
+                }
+                entry.header-search:focus {
+                    background-color: rgba(20, 20, 28, 0.85);
+                    border-color: alpha(@accent_color, 0.6);
                 }
 
                 /* === Yüzen indirme hapı: kapsül kabı, düğmeleri sarar === */
@@ -499,7 +619,13 @@ fn main() {
                         migrated = old_exec != desktop_exec_target(&home);
                     }
                 }
-                let _ = install_desktop_entry();
+                // AppImage kopyası + update-desktop-database UI thread'i
+                // bloklar (saniyeler); arka plana alınır.
+                std::thread::spawn(|| {
+                    if let Err(e) = install_desktop_entry() {
+                        eprintln!("[STARTUP] kısayol kurulumu atlandı: {e}");
+                    }
+                });
                 if migrated {
                     eprintln!("[STARTUP] kurulu kısayol yeni çalıştırılan AppImage'a taşındı");
                 }
@@ -541,6 +667,32 @@ fn main() {
             );
         }
         app_inst.window.present();
+        // Kapak wipe'ı bu açılışta yapıldıysa (bayrak tüketildi) bilgi ver:
+        // silme zaten bitti, tek butonla kapatılır (zorunlu modal).
+        if app_inst.client.covers_wiped_this_boot {
+            let dlg = adw::MessageDialog::builder()
+                .heading("Önbellek Sıfırlandı")
+                .body(
+                    "Kapak önbelleği yeni biçime geçirildi. \
+                     Ayarların, geçmişin ve indirmelerin silinmedi.",
+                )
+                .close_response("ok")
+                .default_response("ok")
+                .build();
+            dlg.add_response("ok", "Tamam");
+            dlg.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+            dlg.set_transient_for(Some(&app_inst.window));
+            dlg.present();
+        }
+        // Yenilik popup'ı açılış kalabalığına karışmasın: 2.5sn gecikmeli,
+        // sürüm başına bir kez (guard maybe_show_changelog içinde).
+        {
+            let inst = app_inst.clone();
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(2500),
+                move || inst.maybe_show_changelog(),
+            );
+        }
     });
 
     let argv: Vec<&str> = filtered.iter().map(|s| s.as_str()).collect();
@@ -841,6 +993,140 @@ mod tests {
             desktop_exec_target("/home/x"),
             "/home/x/.local/bin/animecix"
         );
+    }
+}
+
+/// Bizim ikon yollarını listenin başına al (gtk4 0.8'de `prepend_search_path`
+/// yok; `search_path` + `set_search_path` ile aynı iş).
+/// Var olmayan yol zararsız (yok sayılır), tekrar eklenmez.
+fn prepend_icon_paths(theme: &gtk::IconTheme, ours: &[std::path::PathBuf]) {
+    let mut combined: Vec<std::path::PathBuf> = ours.to_vec();
+    for p in theme.search_path() {
+        if !combined.contains(&p) {
+            combined.push(p);
+        }
+    }
+    let refs: Vec<&std::path::Path> = combined.iter().map(|p| p.as_path()).collect();
+    theme.set_search_path(&refs);
+}
+
+fn cmd_check_icons() {
+    // GTK'yı başlatsız tema okunamaz; init başarısızsa liste basılamaz.
+    if gtk::init().is_err() {
+        eprintln!("--check-icons: gtk::init başarısız (displaysiz ortam?)");
+        std::process::exit(2);
+    }
+    let Some(display) = gtk::gdk::Display::default() else {
+        eprintln!("--check-icons: Display yok");
+        std::process::exit(2);
+    };
+    // Gerçek çalışma düzeniyle aynı yollar (connect_activate ile eşleşmeli).
+    let mut base = std::path::PathBuf::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            base = dir.to_path_buf();
+        }
+    }
+    if let Ok(ad) = std::env::var("APPDIR") {
+        if !ad.is_empty() {
+            base = std::path::PathBuf::from(ad);
+        }
+    }
+    let theme = gtk::IconTheme::for_display(&display);
+    {
+        let mut ours: Vec<std::path::PathBuf> = vec![
+            base.join("usr/share/icons"),
+            base.join("usr/share/animecix/assets/hicolor"),
+            base.join("usr/share/animecix/assets"),
+            base.join("assets/hicolor"),
+            base.join("assets"),
+        ];
+        if let Some(root) = base.ancestors().nth(2) {
+            ours.push(root.join("assets/hicolor"));
+            ours.push(root.join("assets"));
+        }
+        prepend_icon_paths(&theme, &ours);
+        gtk::Settings::for_display(&display).set_gtk_icon_theme_name(Some("Adwaita"));
+    }
+    println!("search_path={:?}", theme.search_path());
+    println!("theme_name={:?}", theme.theme_name());
+    // Kodda geçen kritik set + bilerek-eksik bir ad (fallback kanıtı).
+    let names = [
+        "go-home-symbolic",
+        "view-grid-symbolic",
+        "starred-symbolic",
+        "non-starred-symbolic",
+        "media-playlist-consecutive-symbolic",
+        "document-open-recent-symbolic",
+        "x-office-calendar-symbolic",
+        "view-list-symbolic",
+        "folder-download-symbolic",
+        "folder-open-symbolic",
+        "emblem-system-symbolic",
+        "system-search-symbolic",
+        "go-previous-symbolic",
+        "go-next-symbolic",
+        "media-playback-start-symbolic",
+        "media-playback-pause-symbolic",
+        "bu-ad-yok-symbolic",
+    ];
+    let mut ok = 0u32;
+    let mut fail = 0u32;
+    for n in &names {
+        // Önce hafif yoklama: lookup_icon(bulunamayan) bazı GTK
+        // zincirlerinde son-çare image-missing aramasını döndürüp
+        // taşırdığından doğrudan lookup'a girilmez.
+        if !theme.has_icon(n) {
+            if *n == "bu-ad-yok-symbolic" {
+                ok += 1;
+                println!("  [ABSENT-OK] {n} (beklendiği gibi yok)");
+            } else {
+                fail += 1;
+                println!("  [MISSING] {n}");
+            }
+            continue;
+        }
+        let found = theme.lookup_icon(
+            n,
+            &[],
+            48,
+            1,
+            gtk::TextDirection::None,
+            gtk::IconLookupFlags::empty(),
+        );
+        match found.file().and_then(|f| f.path()) {
+            Some(p) => {
+                let pstr = p.to_string_lossy();
+                let ours = pstr.contains("appimage_extracted")
+                    || pstr.contains("animecix")
+                    || pstr.contains("assets/hicolor");
+                let tag = if ours { "OURS" } else { "SYSTEM" };
+                if *n == "bu-ad-yok-symbolic" {
+                    fail += 1;
+                    println!("  [UNEXPECTED] {n} -> {tag} {}", p.display());
+                } else {
+                    if ours {
+                        ok += 1;
+                    } else {
+                        fail += 1;
+                    }
+                    println!("  [{tag:6}] {n} -> {}", p.display());
+                }
+            }
+            None => {
+                if *n == "bu-ad-yok-symbolic" {
+                    ok += 1;
+                    println!("  [ABSENT-OK] {n} (beklendiği gibi yok)");
+                } else {
+                    fail += 1;
+                    println!("  [MISSING] {n}");
+                }
+            }
+        }
+    }
+    println!("Sonuç: {ok} OK, {fail} sistem/yok");
+    if fail > 0 {
+        std::process::exit(1);
     }
 }
 

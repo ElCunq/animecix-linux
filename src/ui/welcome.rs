@@ -208,6 +208,7 @@ impl WelcomeView {
         pref_group.add(&music_hint_row);
         root.append(&pref_group);
 
+        let on_finish = Rc::new(on_finish);
         // Başlat.
         let start_btn = gtk::Button::with_label("Başlamaya Hazırım 🚀");
         start_btn.add_css_class("suggested-action");
@@ -217,6 +218,7 @@ impl WelcomeView {
         start_btn.set_margin_top(12);
         {
             let base = settings.clone();
+            let f = on_finish.clone();
             start_btn.connect_clicked(move |_| {
                 let mut s = base.clone();
                 s.auto_fullscreen = fs_sw.is_active();
@@ -226,10 +228,24 @@ impl WelcomeView {
                     .get(theme_row.selected() as usize)
                     .map(|(id, _)| id.to_string())
                     .unwrap_or_else(|| crate::theme::DEFAULT_THEME.to_string());
-                on_finish(s);
+                f(s);
             });
         }
         root.append(&start_btn);
+
+        // Atla: ayarla oynamadan çık (bayrak görünüm kurulurken yazıldı).
+        let skip_btn = gtk::Button::with_label("Atla →");
+        skip_btn.add_css_class("flat");
+        skip_btn.add_css_class("pill");
+        skip_btn.set_halign(gtk::Align::Center);
+        {
+            let f = on_finish.clone();
+            let s = settings.clone();
+            skip_btn.connect_clicked(move |_| {
+                f(s.clone());
+            });
+        }
+        root.append(&skip_btn);
 
         // Orta-alt kaydırma oku: dipte değilken görünür (yazısız, silik zeminli).
         let down_hint = gtk::Image::from_icon_name("go-down-symbolic");
@@ -262,6 +278,21 @@ impl WelcomeView {
         page.set_child(Some(&scroll));
         page.add_overlay(&down_bg);
         scroll.set_child(Some(&root));
+        // Esc de çıkıştır (butona ulaşamayan klavye kullanıcısı için).
+        {
+            let f = on_finish.clone();
+            let s = settings.clone();
+            let esc = gtk::EventControllerKey::new();
+            esc.connect_key_pressed(move |_, keyval, _, _| {
+                if keyval.name().map(|s| s.to_string()).unwrap_or_default() == "Escape" {
+                    f(s.clone());
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+            page.add_controller(esc);
+        }
         page
     }
 }

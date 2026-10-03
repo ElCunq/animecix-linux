@@ -455,7 +455,7 @@ impl SettingsView {
         let shortcut_row = adw::ComboRow::new();
         shortcut_row.set_title("Kısayol Tuşu");
         shortcut_row.set_subtitle("Bölüm sayfasında aramayı başlatacak klavye kısayolu");
-        let ep_shortcuts = &["/", "Ctrl+F", "F3", "Ctrl+K"];
+        let ep_shortcuts = &["/", "Ctrl+F", "F3"];
         let ep_shortcut_model = gtk::StringList::new(ep_shortcuts);
         shortcut_row.set_model(Some(&ep_shortcut_model));
         let current_ep_sc = ep_shortcuts.iter().position(|&s| s == settings.quick_search_shortcut).unwrap_or(0);
@@ -472,7 +472,7 @@ impl SettingsView {
         let search_sc_row = adw::ComboRow::new();
         search_sc_row.set_title("Kısayol Tuşu");
         search_sc_row.set_subtitle("Ana ekranda arama çubuğunu açacak klavye kısayolu");
-        let search_shortcuts = &["Ctrl+S", "Ctrl+K", "F2", "/"];
+        let search_shortcuts = &["Ctrl+S", "F2", "/"];
         let search_sc_model = gtk::StringList::new(search_shortcuts);
         search_sc_row.set_model(Some(&search_sc_model));
         let current_sc = search_shortcuts.iter().position(|&s| s == settings.search_shortcut).unwrap_or(0);
@@ -480,41 +480,41 @@ impl SettingsView {
         search_group.add(&search_sc_row);
         root.append(&search_group);
 
-        let tools_group = adw::PreferencesGroup::new();
-        tools_group.set_title("Sayfalar Menüsü Kısayolu");
-
-        let tools_sc_row = adw::ComboRow::new();
-        tools_sc_row.set_title("Kısayol Tuşu");
-        tools_sc_row.set_subtitle("Sayfalar menüsünü açacak klavye kısayolu (çıplak T metin alanında çalışmaz)");
-        let tools_sc_model =
-            gtk::StringList::new(&crate::ui::tools_menu::TOOL_SHORTCUT_OPTIONS);
-        tools_sc_row.set_model(Some(&tools_sc_model));
-        let current_tools_sc = crate::ui::tools_menu::TOOL_SHORTCUT_OPTIONS
-            .iter()
-            .position(|&s| s == settings.tools_shortcut)
-            .unwrap_or(0);
-        tools_sc_row.set_selected(current_tools_sc as u32);
-        tools_group.add(&tools_sc_row);
-        root.append(&tools_group);
-
         let view_group = adw::PreferencesGroup::new();
         view_group.set_title("Görünüm");
 
-        let scale_row = adw::ComboRow::new();
-        scale_row.set_title("Arayüz Ölçeği");
-        scale_row.set_subtitle("Büyük monitörlerde arayüzü büyütür, anında uygulanır");
-        let scales = &["%100 (Normal)", "%125", "%150"];
-        let scale_model = gtk::StringList::new(scales);
-        scale_row.set_model(Some(&scale_model));
-        let current_scale = if (settings.ui_scale - 1.25).abs() < 0.01 {
-            1
-        } else if settings.ui_scale >= 1.4 {
-            2
-        } else {
-            0
-        };
-        scale_row.set_selected(current_scale);
+        let scale_row = adw::ActionRow::new();
+        scale_row.set_title("Arayüz Ölçeği (%)");
+        scale_row.set_subtitle("100 ile 125 arasında, anında uygulanır");
+        let scale_adj = gtk::Adjustment::new(
+            (settings.ui_scale.clamp(1.0, 1.25) * 100.0) as f64,
+            100.0,
+            125.0,
+            1.0,
+            5.0,
+            0.0,
+        );
+        let scale_spin = gtk::SpinButton::new(Some(&scale_adj), 1.0, 0);
+        scale_spin.set_numeric(true);
+        scale_spin.set_value((settings.ui_scale.clamp(1.0, 1.25) * 100.0) as f64);
+        scale_row.add_suffix(&scale_spin);
         view_group.add(&scale_row);
+
+        let news_font_row = adw::ComboRow::new();
+        news_font_row.set_title("Haber Yazı Boyutu");
+        news_font_row.set_subtitle("Haber okuma ekranındaki gövde metni");
+        let news_font_names: Vec<&str> = crate::api::NEWS_FONT_OPTIONS
+            .iter()
+            .map(|(_, n)| *n)
+            .collect();
+        let news_font_model = gtk::StringList::new(&news_font_names);
+        news_font_row.set_model(Some(&news_font_model));
+        let current_news_font = crate::api::NEWS_FONT_OPTIONS
+            .iter()
+            .position(|(id, _)| *id == settings.news_font_size)
+            .unwrap_or(1);
+        news_font_row.set_selected(current_news_font as u32);
+        view_group.add(&news_font_row);
 
         let theme_row = adw::ComboRow::new();
         theme_row.set_title("Tema");
@@ -723,8 +723,8 @@ impl SettingsView {
             let st_r = search_toggle.clone();
             let sc_r = shortcut_row.clone();
             let ssc_r = search_sc_row.clone();
-            let tsc_r = tools_sc_row.clone();
-            let scale_r = scale_row.clone();
+            let scale_spin_c = scale_spin.clone();
+            let nf_r = news_font_row.clone();
             let theme_r = theme_row.clone();
             let fs_r = fs_sw.clone();
             let ih_r = intro_hint_sw.clone();
@@ -746,26 +746,18 @@ impl SettingsView {
                 updated.quick_search_shortcut = match sc_r.selected() {
                     1 => "Ctrl+F".into(),
                     2 => "F3".into(),
-                    3 => "Ctrl+K".into(),
                     _ => "/".into(),
                 };
                 updated.search_shortcut = match ssc_r.selected() {
-                    1 => "Ctrl+K".into(),
-                    2 => "F2".into(),
-                    3 => "/".into(),
+                    1 => "F2".into(),
+                    2 => "/".into(),
                     _ => "Ctrl+S".into(),
                 };
-                updated.tools_shortcut = match tsc_r.selected() {
-                    1 => "Alt+T".into(),
-                    2 => "F10".into(),
-                    3 => "T".into(),
-                    _ => "Ctrl+T".into(),
-                };
-                updated.ui_scale = match scale_r.selected() {
-                    1 => 1.25,
-                    2 => 1.5,
-                    _ => 1.0,
-                };
+                updated.ui_scale = (scale_spin_c.value() / 100.0).clamp(1.0, 1.25) as f32;
+                updated.news_font_size = crate::api::NEWS_FONT_OPTIONS
+                    .get(nf_r.selected() as usize)
+                    .map(|(id, _)| id.to_string())
+                    .unwrap_or_else(|| "normal".to_string());
                 updated.theme = crate::theme::THEMES
                     .get(theme_r.selected() as usize)
                     .map(|(id, _)| id.to_string())
@@ -805,10 +797,10 @@ impl SettingsView {
         shortcut_row.connect_selected_notify(move |_| sa2());
         let sa3 = save_all.clone();
         search_sc_row.connect_selected_notify(move |_| sa3());
-        let sa_tools = save_all.clone();
-        tools_sc_row.connect_selected_notify(move |_| sa_tools());
         let sa_scale = save_all.clone();
-        scale_row.connect_selected_notify(move |_| sa_scale());
+        scale_spin.connect_value_changed(move |_| sa_scale());
+        let sa_nf = save_all.clone();
+        news_font_row.connect_selected_notify(move |_| sa_nf());
         let sa_theme = save_all.clone();
         theme_row.connect_selected_notify(move |_| sa_theme());
         let sa4 = save_all.clone();

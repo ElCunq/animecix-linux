@@ -23,6 +23,9 @@ pub enum Page {
     Settings,
     Search,
     Downloads,
+    Kesfet,
+    Calendar,
+    News,
     Episodes { title: Title, eps: Vec<Episode> },
     Movie { title: Title, eps: Vec<Episode> },
 }
@@ -38,6 +41,9 @@ pub struct PlaySources {
 pub enum Msg {
     Cats(Result<Vec<api::Category>, String>),
     Search(Result<Vec<Title>, String>),
+    News(u32, Result<(Vec<api::NewsItem>, usize, u32), String>),
+    Calendar(Result<Vec<api::CalendarDay>, String>),
+    Discover(Result<(Vec<Title>, usize, u32), String>),
     Eps(Title, Result<Vec<Episode>, String>),
     Play(Title, Episode, Result<PlaySources, String>),
     FansubsLoaded {
@@ -71,11 +77,8 @@ pub struct App {
     pub window: adw::ApplicationWindow,
     pub stack: gtk::Stack,
     pub back_btn: gtk::Button,
-    pub tools_menu: Rc<RefCell<Option<crate::ui::tools_menu::ToolsMenu>>>,
-    pub search_toggle_btn: gtk::Button,
+    pub header_search: gtk::SearchEntry,
     pub title_label: gtk::Label,
-    pub search_bar: gtk::SearchBar,
-    pub search_entry: gtk::SearchEntry,
     pub loading: gtk::Box,
     pub toast: adw::ToastOverlay,
     pub client: Arc<Client>,
@@ -95,30 +98,156 @@ pub struct App {
     pub dl_manager: crate::download::DownloadManager,
     /// Bölüm hızlı-arama tuşu: sayfa başına tek controller (birikmeyi önler).
     pub ep_search_controller: Rc<RefCell<Option<gtk::EventControllerKey>>>,
+    /// Yan ray: (sayfa, satır, etiket, tam ad) + daraltma durumu
+    /// (Lowell137/animecix-linux SideItem birebir).
+    pub sidebar_rows: Rc<RefCell<Vec<(Page, gtk::Button, gtk::Label, String)>>>,
+    pub sidebar_collapsed: Rc<Cell<bool>>,
+    pub sidebar_box: gtk::Box,
+    /// Spotlight yüksekliği (pencereye göre; Lowell hero_h_for_window).
+    pub hero_h: Rc<Cell<i32>>,
+    /// Ev görünümü kirlendi mi? (view-cache geçersizleme bayrağı)
+    pub home_dirty: Rc<Cell<bool>>,
+    /// Raf kart boyu + sütun sayısı (kuantum responsive).
+    pub card_w: Rc<Cell<i32>>,
+    pub grid_cols: Rc<Cell<u32>>,
+    /// Haberler önbelleği: (öğeler, toplam, son_sayfa) + istenen sayfa.
+    pub news: Rc<RefCell<Option<(Vec<api::NewsItem>, usize, u32)>>>,
+    pub news_page: Rc<Cell<u32>>,
+    /// Takvim önbelleği.
+    pub calendar: Rc<RefCell<Option<Vec<api::CalendarDay>>>>,
+    /// Keşfet filtresi + sonuç önbelleği: (öğeler, toplam, son_sayfa).
+    pub discover_filter: Rc<RefCell<api::DiscoverFilter>>,
+    pub discover: Rc<RefCell<Option<(Vec<Title>, usize, u32)>>>,
+    /// Arayüz ölçeği CSS sağlayıcısı (sürekli 100-125 değeri; kalıcı).
+    pub scale_css: gtk::CssProvider,
+}
+
+/// Spotlight yüksekliği: pencere boyunun %52'si (20px kuantum) ile
+/// sütun tabanının büyüğü, 360–560 kelepçeli (Lowell hero_h_for_window birebir).
+fn hero_h_for_window(win_h: i32, cols: u32) -> i32 {
+    let from_h = (win_h as f32 * 0.52) as i32 / 20 * 20;
+    let from_c = 260 + cols.max(3).min(8) as i32 * 20;
+    from_h.max(from_c).clamp(360, 560)
+}
+
+/// Kart kuantumu: genişlikten sütun (3-8) + kart boyu (140-220, 10px
+/// kuantum). Pencere büyüyünce kartlar da büyür (sabit 140 dönemi kapandı).
+fn card_quantum(win_w: i32) -> (u32, i32) {
+    let cols = ((win_w / 180).max(3).min(8)) as u32;
+    let raw = (win_w - 24 - (cols as i32 - 1) * 16) / cols as i32;
+    let w = (raw / 10 * 10).clamp(140, 220);
+    (cols, w)
+}
+
+/// Spotlight seçimi (saf): havuzdan slot_count başlık. Şimdilik karıştır +
+/// ilk N; algoritma değişince sadece bu fonksiyonun içi değişir.
+fn pick_spotlight(pool: &[Title], slot_count: usize, seed: u64) -> Vec<Title> {
+    let mut idx: Vec<usize> = (0..pool.len()).collect();
+    // Basit LCG shuffle (harici crate yok).
+    let mut s = seed | 1;
+    for i in (1..idx.len()).rev() {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let j = (s >> 33) as usize % (i + 1);
+        idx.swap(i, j);
+    }
+    idx.into_iter()
+        .take(slot_count)
+        .map(|i| pool[i].clone())
+        .collect()
+}
+
+/// Oturum tohumu bir kez: her açılışta farklı sıra, oturum boyu sabit
+/// (yeniden kurulumlarda hero zıplamaz).
+fn spot_seed() -> u64 {
+    static SPOT_SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SPOT_SEED.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9e3779b9)
+    })
+}
+/// Hero havuzu: tüm kategorilerden birleşik + id-dedup + görselli.
+/// Sıralama: rating ≥7 bonus, son 15 yıl öne (eskiler elenmez, arkaya).
+/// Bölüm filtresi (yumuşak): kesin-boş anime (`episode_count == Some(0)`)
+/// elenir; bilinmeyen (None) arkaya itilir, filmler muaf tutulur.
+/// Karıştırma `pick_spotlight`'ta; havuz darsa bile boş dönmez.
+/// Gerçek oynatılabilirlik arka-plan `episodes()` ön-kontrolüyle netleşir
+/// (`build_spotlight_async`); burası yalnız ucuz eleme yapar.
+fn hero_pool(cats: &[api::Category]) -> Vec<Title> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut scored: Vec<(i64, Title)> = Vec::new();
+    for cat in cats {
+        for t in &cat.items {
+            if !seen.insert(t.id) {
+                continue;
+            }
+            if t.backdrop.is_none() && t.poster.is_none() {
+                continue;
+            }
+            let is_movie = t.title_type.as_deref() == Some("movie");
+            if !is_movie && t.episode_count == Some(0) {
+                continue;
+            }
+            let mut score = 0i64;
+            if t.rating.unwrap_or(0.0) >= 7.0 {
+                score += 100;
+            }
+            match t.year {
+                Some(y) if y >= 2011 => score += 50,
+                None => score -= 10,
+                _ => {}
+            }
+            if !is_movie && t.episode_count.is_none() {
+                score -= 30;
+            }
+            scored.push((score, t.clone()));
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().map(|(_, t)| t).collect()
 }
 
 /// Geri-dönüş geçiş bayrağı (switch içinde tüketilir).
 static BACK_ANIM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// İnternet durumu (60sn TTL önbellekli; geri-dönüşte senkron ağı engeller).
-fn cached_internet_status() -> crate::api::InternetStatus {
+/// İnternet durumu önbelleği (60sn TTL). İlk boyama asla bloklamaz:
+/// soğukken iyimser (çevrimiçi) çizilir, gerçek kontrol `App::new`
+/// sonundaki warmer thread ile yapılıp rozet tazelenir.
+fn internet_cache() -> &'static std::sync::Mutex<(
+    Option<std::time::Instant>,
+    Option<crate::api::InternetStatus>,
+)> {
     use std::sync::{Mutex, OnceLock};
-    use std::time::{Duration, Instant};
-    static CACHE: OnceLock<Mutex<(Option<Instant>, Option<crate::api::InternetStatus>)>> =
+    static CACHE: OnceLock<Mutex<(Option<std::time::Instant>, Option<crate::api::InternetStatus>)>> =
         OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new((None, None)));
-    if let Ok(guard) = cache.lock() {
-        if let (Some(at), Some(st)) = (&guard.0, &guard.1) {
-            if at.elapsed() < Duration::from_secs(60) {
-                return st.clone();
-            }
+    CACHE.get_or_init(|| Mutex::new((None, None)))
+}
+
+/// Taze önbellek varsa klonu (yoksa None; ağa dokunmaz).
+fn internet_cached() -> Option<crate::api::InternetStatus> {
+    let guard = internet_cache().lock().ok()?;
+    let (at, st) = (&guard.0, &guard.1);
+    match (at, st) {
+        (Some(at), Some(st)) if at.elapsed() < std::time::Duration::from_secs(60) => {
+            Some(st.clone())
         }
+        _ => None,
     }
-    let st = crate::api::check_internet();
-    if let Ok(mut guard) = cache.lock() {
-        *guard = (Some(Instant::now()), Some(st.clone()));
+}
+
+fn store_internet_status(st: crate::api::InternetStatus) {
+    if let Ok(mut guard) = internet_cache().lock() {
+        *guard = (Some(std::time::Instant::now()), Some(st));
     }
-    st
+}
+
+/// Önbellek taze mi? (ilk boyama kararı; ağa dokunmaz).
+fn internet_cache_fresh() -> bool {
+    internet_cached().is_some()
 }
 
 pub(crate) fn resolve_upscale_shader(name: &str) -> Option<String> {    use std::sync::OnceLock;
@@ -199,9 +328,98 @@ fn restore_downloads_scroll(stack: gtk::Stack, value: f64, attempt: u8) {
     });
 }
 
+/// Raf başlığı + pager (ev/devam ortak; Lowell pager_head uyarlaması).
+/// Dönen `wire` FlowBox'a bağlanır: görünürlük penceresi + sayaç + oklar.
+fn build_shelf_pager(title: &str, total: usize, per: usize) -> (gtk::Box, Rc<dyn Fn(&gtk::FlowBox)>) {
+    let per = per.max(1);
+    let pages = ((total + per - 1) / per).max(1);
+    let page = Rc::new(Cell::new(0usize));
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let shelf_title = gtk::Label::new(Some(title));
+    shelf_title.add_css_class("shelf-title");
+    shelf_title.set_xalign(0.0);
+    shelf_title.set_hexpand(true);
+    shelf_title.set_margin_start(4);
+    head.append(&shelf_title);
+    let counter = gtk::Label::new(None);
+    counter.add_css_class("dim-label");
+    counter.set_valign(gtk::Align::Center);
+    head.append(&counter);
+    let prev_btn = gtk::Button::from_icon_name("go-previous-symbolic");
+    prev_btn.add_css_class("flat");
+    prev_btn.add_css_class("circular");
+    let next_btn = gtk::Button::from_icon_name("go-next-symbolic");
+    next_btn.add_css_class("flat");
+    next_btn.add_css_class("circular");
+    head.append(&prev_btn);
+    head.append(&next_btn);
+    let slot: Rc<RefCell<Option<gtk::FlowBox>>> = Rc::new(RefCell::new(None));
+    let apply = {
+        let counter = counter.clone();
+        let prev_btn = prev_btn.clone();
+        let next_btn = next_btn.clone();
+        let page = page.clone();
+        let slot = slot.clone();
+        Rc::new(move || {
+            let Some(flow) = slot.borrow().clone() else {
+                return;
+            };
+            let p = page.get().min(pages.saturating_sub(1));
+            page.set(p);
+            for i in 0..total {
+                if let Some(ch) = flow.child_at_index(i as i32) {
+                    ch.set_visible(i >= p * per && i < p * per + per);
+                }
+            }
+            let a = if total == 0 { 0 } else { p * per + 1 };
+            let b = ((p + 1) * per).min(total);
+            counter.set_text(&format!("{a}–{b} / {total}"));
+            prev_btn.set_sensitive(p > 0);
+            next_btn.set_sensitive(p + 1 < pages);
+        })
+    };
+    {
+        let apply_p = apply.clone();
+        let page_p = page.clone();
+        prev_btn.connect_clicked(move |_| {
+            page_p.set(page_p.get().saturating_sub(1));
+            apply_p();
+        });
+    }
+    {
+        let apply_n = apply.clone();
+        let page_p = page.clone();
+        next_btn.connect_clicked(move |_| {
+            page_p.set(page_p.get() + 1);
+            apply_n();
+        });
+    }
+    // Tek sayfada oklar gizlenir.
+    if pages <= 1 {
+        prev_btn.set_visible(false);
+        next_btn.set_visible(false);
+        counter.set_visible(false);
+    }
+    let wire = {
+        let slot = slot.clone();
+        let apply = apply.clone();
+        Rc::new(move |flow: &gtk::FlowBox| {
+            *slot.borrow_mut() = Some(flow.clone());
+            apply();
+        })
+    };
+    (head, wire)
+}
+
 impl App {
     pub fn new(app: &adw::Application) -> Rc<Self> {
         let client = Arc::new(Client::new());
+
+        // Açılışta state TEK kez okunur (hydrate pahalı olabilir; iki ayrı
+        // load_state çağrısı maliyeti ikiye katlardı).
+        let init_state = client.load_state();
+        let welcome_seen = init_state.welcome_seen;
+        let init_progress = init_state.progress;
 
         {
             let cl = client.clone();
@@ -210,7 +428,7 @@ impl App {
                 let _ = cl.home_lists();
             });
         }
-        let welcome_seen = client.is_welcome_seen();
+        let welcome_seen = init_state.welcome_seen;
 
         let header = adw::HeaderBar::new();
         let title_label = gtk::Label::new(Some("AnimeciX"));
@@ -225,23 +443,19 @@ impl App {
         back_btn.set_visible(false);
         header.pack_start(&back_btn);
 
-        let search_toggle_btn = gtk::Button::from_icon_name("system-search-symbolic");
-        search_toggle_btn.add_css_class("flat");
-        search_toggle_btn.add_css_class("circular");
-        search_toggle_btn.set_tooltip_text(Some("Arama Yap"));
-        header.pack_end(&search_toggle_btn);
+        // Headbar hızlı arama hapı: geniş, hap biçimli, düşük opak zemin
+        // (Lowell hızlı-hap tokenleri: 999px + rgba zemin). Yazınca
+        // popup'a devreder, Enter boşken boş popup açar.
+        let header_search = gtk::SearchEntry::new();
+        header_search.set_placeholder_text(Some("Anime veya dizi ara…"));
+        header_search.add_css_class("pill");
+        header_search.add_css_class("header-search");
+        header_search.set_valign(gtk::Align::Center);
+        header_search.set_hexpand(true);
+        header_search.set_halign(gtk::Align::Fill);
+        header_search.set_tooltip_text(Some("Arama Yap"));
+        header.pack_end(&header_search);
         // Sayfalar butonu App::new sonunda (goto kablosu Rc gerektirir) eklenir.
-
-        let search_entry = gtk::SearchEntry::new();
-        search_entry.set_placeholder_text(Some("Anime, dizi veya film ara…"));
-        search_entry.set_hexpand(true);
-
-        let search_bar = gtk::SearchBar::new();
-        search_bar.set_child(Some(&search_entry));
-        search_bar.connect_entry(&search_entry);
-        search_bar.set_key_capture_widget(Some(&app.active_window().unwrap_or_default()));
-
-
 
         let main_stack = gtk::Stack::new();
         main_stack.set_transition_type(gtk::StackTransitionType::SlideLeftRight);
@@ -272,21 +486,35 @@ impl App {
         overlay.set_vexpand(true);
         overlay.set_hexpand(true);
 
-        let header_for_tools = header.clone();
+        // Yan ray kabuğu (satırlar App::new sonunda dolar; Lowell uyarlaması).
+        let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        sidebar_box.set_margin_top(8);
+        sidebar_box.set_margin_bottom(8);
+        sidebar_box.set_margin_start(8);
+        sidebar_box.set_margin_end(4);
+        sidebar_box.set_valign(gtk::Align::Fill);
+        sidebar_box.set_vexpand(true);
+        sidebar_box.set_halign(gtk::Align::Start);
+        sidebar_box.set_hexpand(false);
+        sidebar_box.set_width_request(164);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.set_hexpand(true);
         content.append(&header);
-        content.append(&search_bar);
         content.append(&overlay);
+        let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        body.append(&sidebar_box);
+        let sep = gtk::Separator::new(gtk::Orientation::Vertical);
+        body.append(&sep);
+        body.append(&content);
 
         let toast = adw::ToastOverlay::new();
-        toast.set_child(Some(&content));
+        toast.set_child(Some(&body));
 
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("AnimeciX")
-            .default_width(980)
-            .default_height(720)
-            .resizable(false)
+            .default_width(1280)
+            .default_height(800)
             .content(&toast)
             .build();
 
@@ -304,11 +532,8 @@ impl App {
             window,
             stack: main_stack,
             back_btn,
-            tools_menu: Rc::new(RefCell::new(None)),
-            search_toggle_btn,
+            header_search,
             title_label,
-            search_bar,
-            search_entry,
             loading,
             toast,
             client: client.clone(),
@@ -317,7 +542,7 @@ impl App {
             cats: Rc::new(RefCell::new(Vec::new())),
             search_results: Rc::new(RefCell::new(Vec::new())),
             settings: Rc::new(RefCell::new(client.load_settings())),
-            progress: Rc::new(RefCell::new(client.load_state().progress)),
+            progress: Rc::new(RefCell::new(init_progress)),
             progress_bars: Rc::new(RefCell::new(HashMap::new())),
             dl_rows: Rc::new(RefCell::new(HashMap::new())),
             loading_toast: Rc::new(RefCell::new(None)),
@@ -327,40 +552,154 @@ impl App {
             home_acts: Rc::new(RefCell::new(Vec::new())),
             dl_manager,
             ep_search_controller: Rc::new(RefCell::new(None)),
+            sidebar_rows: Rc::new(RefCell::new(Vec::new())),
+            sidebar_collapsed: Rc::new(Cell::new(false)),
+            sidebar_box,
+            hero_h: Rc::new(Cell::new(hero_h_for_window(800, 5))),
+            home_dirty: Rc::new(Cell::new(true)),
+            card_w: Rc::new(Cell::new(card_quantum(1280).1)),
+            grid_cols: Rc::new(Cell::new(card_quantum(1280).0)),
+            news: Rc::new(RefCell::new(None)),
+            news_page: Rc::new(Cell::new(1)),
+            calendar: Rc::new(RefCell::new(None)),
+            discover_filter: Rc::new(RefCell::new(api::DiscoverFilter {
+                page: 1,
+                ..Default::default()
+            })),
+            discover: Rc::new(RefCell::new(None)),
+            scale_css: Self::make_scale_css(),
         });
         {
-            // Sayfalar menüsü: goto kablosu Rc gerektirdiği için burada kurulur.
-            let inst = app_inst.clone_ref();
-            let goto: Rc<dyn Fn(usize)> = Rc::new(move |i| {
-                let target = match i {
-                    0 => Page::Home,
-                    1 => Page::Favs,
-                    2 => Page::Marathon,
-                    3 => Page::History,
-                    4 => Page::Downloads,
-                    _ => Page::Settings,
-                };
-                let mut st = inst.page_history.borrow_mut();
-                if st.last() != Some(&target) {
-                    st.push(target.clone());
-                }
-                drop(st);
-                inst.show_page(&target);
-                if target == Page::Home {
-                    inst.fetch_home();
-                }
-            });
-            let settings_c = app_inst.settings.clone();
-            let shortcut_label: Rc<dyn Fn() -> String> =
-                Rc::new(move || settings_c.borrow().tools_shortcut.clone());
-            let menu = crate::ui::tools_menu::ToolsMenu::build(
-                goto,
-                app_inst.toast.clone(),
-                app_inst.client.clone(),
-                shortcut_label,
-            );
-            header_for_tools.pack_end(&menu.button());
-            *app_inst.tools_menu.borrow_mut() = Some(menu);
+            // Yan ray satırları (Lowell sidebar uyarlaması).
+            let pages: [(Page, &str, &str); 9] = [
+                (Page::Home, "go-home-symbolic", "Ana Sayfa"),
+                (Page::Kesfet, "view-grid-symbolic", "Keşfet"),
+                (Page::Favs, "starred-symbolic", "Favoriler"),
+                (
+                    Page::Marathon,
+                    "media-playlist-consecutive-symbolic",
+                    "Maraton",
+                ),
+                (Page::History, "document-open-recent-symbolic", "Geçmiş"),
+                (
+                    Page::Calendar,
+                    "x-office-calendar-symbolic",
+                    "Takvim",
+                ),
+                (
+                    Page::News,
+                    "view-list-symbolic",
+                    "Haberler",
+                ),
+                (
+                    Page::Downloads,
+                    "folder-download-symbolic",
+                    "İndirilenler",
+                ),
+                (Page::Settings, "emblem-system-symbolic", "Ayarlar"),
+            ];
+            for (p, icon, name) in pages {
+                // Satır yapısı Lowell side_row birebir (marjlar iç kutuda).
+                let btn = gtk::Button::new();
+                btn.add_css_class("flat");
+                btn.add_css_class("side-row");
+                btn.set_tooltip_text(Some(name));
+                btn.set_halign(gtk::Align::Fill);
+                let inner = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+                inner.set_margin_top(6);
+                inner.set_margin_bottom(6);
+                inner.set_margin_start(10);
+                inner.set_margin_end(10);
+                let img = gtk::Image::from_icon_name(icon);
+                img.set_valign(gtk::Align::Center);
+                inner.append(&img);
+                let lbl = gtk::Label::new(Some(name));
+                lbl.set_xalign(0.0);
+                lbl.set_hexpand(true);
+                inner.append(&lbl);
+                btn.set_child(Some(&inner));
+                let inst = app_inst.clone_ref();
+                let pp = p.clone();
+                btn.connect_clicked(move |_| {
+                    inst.open_data_page(&pp);
+                });
+                app_inst.sidebar_box.append(&btn);
+                app_inst
+                    .sidebar_rows
+                    .borrow_mut()
+                    .push((p, btn, lbl, name.to_string()));
+            }
+            let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            spacer.set_vexpand(true);
+            spacer.set_hexpand(false);
+            app_inst.sidebar_box.append(&spacer);
+            // Daraltma satırı: diğer satırlarla aynı yapıda (hizalama otomatik).
+            let collapse_btn = gtk::Button::new();
+            collapse_btn.add_css_class("flat");
+            collapse_btn.add_css_class("side-row");
+            collapse_btn.set_tooltip_text(Some("Yan menüyü daralt/genişlet"));
+            collapse_btn.set_halign(gtk::Align::Fill);
+            let collapse_inner = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            collapse_inner.set_margin_top(6);
+            collapse_inner.set_margin_bottom(6);
+            collapse_inner.set_margin_start(10);
+            collapse_inner.set_margin_end(10);
+            let collapse_img = gtk::Image::from_icon_name("go-previous-symbolic");
+            collapse_img.set_valign(gtk::Align::Center);
+            collapse_inner.append(&collapse_img);
+            let collapse_lbl = gtk::Label::new(Some("Daralt"));
+            collapse_lbl.set_xalign(0.0);
+            collapse_lbl.set_hexpand(true);
+            collapse_inner.append(&collapse_lbl);
+            collapse_btn.set_child(Some(&collapse_inner));
+            {
+                let inst = app_inst.clone_ref();
+                let collapse_lbl_c = collapse_lbl.clone();
+                let collapse_img_c = collapse_img.clone();
+                let collapse_btn_c = collapse_btn.clone();
+                let collapse_inner_c = collapse_inner.clone();
+                collapse_btn.connect_clicked(move |_| {
+                    let now = !inst.sidebar_collapsed.get();
+                    inst.sidebar_collapsed.set(now);
+                    inst.apply_sidebar_collapsed();
+                    // Daralt satırı da aynı dock disiplinine girer.
+                    if now {
+                        collapse_btn_c.add_css_class("side-dock");
+                    } else {
+                        collapse_btn_c.remove_css_class("side-dock");
+                    }
+                    collapse_lbl_c.set_visible(!now);
+                    collapse_inner_c.set_spacing(if now { 0 } else { 10 });
+                    // Geniş modda Fill'e dönülür (koşulsuz Center, Daralt
+                    // satırını ortada takılı bırakıyordu).
+                    collapse_inner_c.set_halign(if now {
+                        gtk::Align::Center
+                    } else {
+                        gtk::Align::Fill
+                    });
+                    collapse_inner_c.set_margin_start(if now { 0 } else { 10 });
+                    collapse_inner_c.set_margin_end(if now { 0 } else { 10 });
+                    collapse_inner_c.set_margin_top(6);
+                    collapse_inner_c.set_margin_bottom(6);
+                    collapse_img_c.set_pixel_size(if now { 18 } else { -1 });
+                    collapse_img_c.set_halign(if now {
+                        gtk::Align::Center
+                    } else {
+                        gtk::Align::Fill
+                    });
+                    if !now {
+                        collapse_btn_c.set_tooltip_text(Some("Yan menüyü daralt/genişlet"));
+                    }
+                    collapse_lbl_c.set_text(if now { "Genişlet" } else { "Daralt" });
+                    collapse_img_c.set_icon_name(if now {
+                        Some("go-next-symbolic")
+                    } else {
+                        Some("go-previous-symbolic")
+                    });
+                });
+            }
+            app_inst.sidebar_box.append(&collapse_btn);
+            app_inst.apply_sidebar_collapsed();
         }
         {
             // Aicix init deferred to Aşama 2
@@ -369,7 +708,6 @@ impl App {
         app_inst.chain_signals();
         app_inst.apply_ui_scale();
         crate::theme::apply_theme(&app_inst.window, &app_inst.settings.borrow().theme);
-        crate::ui::tools_menu::ensure_tools_css();
         {
             // İndirme pompası: kuyruk olaylarını arayüze taşır.
             let pump = app_inst.clone_ref();
@@ -446,9 +784,67 @@ impl App {
                 glib::ControlFlow::Continue
             });
         }
+        // Hero + kart kuantumu pencereye göre (Lowell birebir): layout
+        // değişimini 300ms debounce ile izle, değiştiyse evdeyken kur.
+        {
+            let inst = app_inst.clone_ref();
+            let gen = Rc::new(Cell::new(0u32));
+            let last_h = Rc::new(Cell::new(inst.hero_h.get()));
+            let last_q = Rc::new(Cell::new((inst.grid_cols.get(), inst.card_w.get())));
+            app_inst.window.connect_map(move |w| {
+                let Some(surface) = w.surface() else {
+                    return;
+                };
+                let inst_c = inst.clone_ref();
+                let gen_c = gen.clone();
+                let last_h_c = last_h.clone();
+                let last_q_c = last_q.clone();
+                surface.connect_layout(move |_, ww, h| {
+                    let my = gen_c.get() + 1;
+                    gen_c.set(my);
+                    let gen_c2 = gen_c.clone();
+                    let inst_c2 = inst_c.clone_ref();
+                    let last_h_c2 = last_h_c.clone();
+                    let last_q_c2 = last_q_c.clone();
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(300),
+                        move || {
+                            if gen_c2.get() != my {
+                                return;
+                            }
+                            let nh = hero_h_for_window(h, 5);
+                            let nq = card_quantum(ww);
+                            let mut dirty = false;
+                            if nh != last_h_c2.get() {
+                                last_h_c2.set(nh);
+                                inst_c2.hero_h.set(nh);
+                                dirty = true;
+                            }
+                            if nq != last_q_c2.get() {
+                                last_q_c2.set(nq);
+                                inst_c2.grid_cols.set(nq.0);
+                                inst_c2.card_w.set(nq.1);
+                                dirty = true;
+                            }
+                            if dirty
+                                && inst_c2.page_history.borrow().last() == Some(&Page::Home)
+                            {
+                                inst_c2.show_page(&Page::Home);
+                            }
+                        },
+                    );
+                });
+            });
+        }
         app_inst.show_page(&initial_page);
         if welcome_seen {
             app_inst.fetch_home();
+        }
+        // İnternet rozeti ilk boyamada bekletmesin: cache soğuksa iyimser
+        // çiz (çevrimiçi varsay); gerçek kontrol arka planda yapılıp
+        // bitince ana sayfa tazelenir.
+        if !internet_cache_fresh() {
+            app_inst.refresh_internet_status();
         }
         app_inst.apply_goto_arg();
         app_inst
@@ -459,11 +855,8 @@ impl App {
             window: self.window.clone(),
             stack: self.stack.clone(),
             back_btn: self.back_btn.clone(),
-            tools_menu: self.tools_menu.clone(),
-            search_toggle_btn: self.search_toggle_btn.clone(),
+            header_search: self.header_search.clone(),
             title_label: self.title_label.clone(),
-            search_bar: self.search_bar.clone(),
-            search_entry: self.search_entry.clone(),
             loading: self.loading.clone(),
             toast: self.toast.clone(),
             client: self.client.clone(),
@@ -482,27 +875,54 @@ impl App {
             home_acts: self.home_acts.clone(),
             dl_manager: self.dl_manager.clone(),
             ep_search_controller: self.ep_search_controller.clone(),
+            sidebar_rows: self.sidebar_rows.clone(),
+            sidebar_collapsed: self.sidebar_collapsed.clone(),
+            sidebar_box: self.sidebar_box.clone(),
+            hero_h: self.hero_h.clone(),
+            home_dirty: self.home_dirty.clone(),
+            card_w: self.card_w.clone(),
+            grid_cols: self.grid_cols.clone(),
+            news: self.news.clone(),
+            news_page: self.news_page.clone(),
+            calendar: self.calendar.clone(),
+            discover_filter: self.discover_filter.clone(),
+            discover: self.discover.clone(),
+            scale_css: self.scale_css.clone(),
         })
+    }
+
+    /// Ölçek sağlayıcısı: display'e bir kez takılır, değeri değişir.
+    fn make_scale_css() -> gtk::CssProvider {
+        let p = gtk::CssProvider::new();
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &p,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+        p
     }
 
     fn chain_signals(&self) {
         let this = self.clone_ref();
-        self.search_toggle_btn.connect_clicked(move |_| {
-            let active = !this.search_bar.is_search_mode();
-            this.search_bar.set_search_mode(active);
-            if active {
-                this.search_entry.grab_focus();
-                if !this.client.is_search_tip_seen() {
-                    this.client.set_search_tip_seen(true);
-                    let sc = this.settings.borrow().search_shortcut.clone();
-                    let toast = adw::Toast::new(&format!(
-                        "💡 '{}' kısayolu ile arama çubuğunu hızlıca açabilirsiniz!",
-                        glib::markup_escape_text(&sc)
-                    ));
-                    toast.set_timeout(4);
-                    this.toast.add_toast(toast);
-                }
+        // Headbar hapı: 2+ harfte metni popup'a devret (yazmaya popup'ta
+        // devam edilir); Enter her durumda açar (boşken boş popup).
+        // Modal açıkken headbar girdi alamayacağından bayrak gerekmez:
+        // devirde hap temizlenir, boş metin bekçiye takılır.
+        self.header_search.connect_changed(move |e| {
+            let q = e.text().to_string();
+            if q.chars().count() < 2 {
+                return;
             }
+            e.set_text("");
+            this.open_search_popup_with(&q);
+        });
+        let this = self.clone_ref();
+        self.header_search.connect_activate(move |e| {
+            let q = e.text().to_string();
+            e.set_text("");
+            this.open_search_popup_with(&q);
         });
 
         let this = self.clone_ref();
@@ -510,81 +930,154 @@ impl App {
             this.go_back();
         });
 
-        let this = self.clone_ref();
-        self.search_entry.connect_activate(move |e| {
-            let q = e.text().to_string();
-            if !q.trim().is_empty() {
-                this.do_search(q);
-            }
-        });
-
         {
             let this = self.clone_ref();
-            let search_bar = self.search_bar.clone();
-            let search_entry = self.search_entry.clone();
             let settings = self.settings.clone();
             let window_c = self.window.clone();
-            let tools_c = self.tools_menu.clone();
             let key_ctrl = gtk::EventControllerKey::new();
             key_ctrl.connect_key_pressed(move |_, keyval, _, state| {
-                let sc = settings.borrow().search_shortcut.clone();
                 let key_name = keyval.name().map(|s| s.to_string()).unwrap_or_default();
                 let is_ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+                // Tam ekran (Lowell137/animecix-linux uyarlaması): F11 aç/kapat,
+                // Esc tam ekrandan çıkar (fonksiyon tuşu; metin alanına yazılmaz).
+                if key_name == "F11" {
+                    if gtk::prelude::GtkWindowExt::is_fullscreen(&window_c) {
+                        window_c.unfullscreen();
+                    } else {
+                        window_c.fullscreen();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                if key_name == "Escape" && gtk::prelude::GtkWindowExt::is_fullscreen(&window_c) {
+                    window_c.unfullscreen();
+                    return glib::Propagation::Stop;
+                }
+                // F1: kısayol yardım penceresi (ayar değerlerini yansıtır).
+                if key_name == "F1" {
+                    let s = settings.borrow();
+                    crate::ui::shortcuts::present(
+                        &window_c,
+                        &s.search_shortcut,
+                        &s.quick_search_shortcut,
+                        s.quick_search_enabled,
+                    );
+                    return glib::Propagation::Stop;
+                }
+                let sc = settings.borrow().search_shortcut.clone();
                 let triggered = match sc.as_str() {
-                    "Ctrl+K" => is_ctrl && (key_name == "k" || key_name == "K"),
                     "F2" => key_name == "F2",
                     "/" => key_name == "slash" || key_name == "kp_divide",
                     _ => is_ctrl && (key_name == "s" || key_name == "S"), // Ctrl+S
                 };
                 if triggered {
-                    search_bar.set_search_mode(true);
-                    search_entry.grab_focus();
-
-                    if !this.client.is_search_tip_seen() {
-                        this.client.set_search_tip_seen(true);
-                    }
+                    this.open_search_popup();
                     glib::Propagation::Stop
                 } else {
-                    // Sayfalar kısayolu (ayarlanabilir; çıplak T metin alanında yutulur).
-                    let tsc = settings.borrow().tools_shortcut.clone();
-                    let is_alt = state.contains(gtk::gdk::ModifierType::ALT_MASK);
-                    let editable = gtk::prelude::GtkWindowExt::focus(&window_c)
-                        .map(|f| {
-                            f.is::<gtk::SearchEntry>()
-                                || f.is::<gtk::Entry>()
-                                || f.is::<gtk::Text>()
-                                || f.is::<gtk::SpinButton>()
-                                || f.is::<gtk::PasswordEntry>()
-                        })
-                        .unwrap_or(false);
-                    if crate::ui::tools_menu::match_tools_shortcut(
-                        &tsc, &key_name, is_ctrl, is_alt, editable,
-                    ) {
-                        if let Some(menu) = tools_c.borrow().as_ref() {
-                            let toast_c = this.toast.clone();
-                            let client_c = this.client.clone();
-                            let settings_c2 = settings.clone();
-                            let lbl: Rc<dyn Fn() -> String> = Rc::new(move || {
-                                settings_c2.borrow().tools_shortcut.clone()
-                            });
-                            if menu.is_open() {
-                                menu.close();
-                            } else {
-                                menu.open(&toast_c, &client_c, &lbl);
-                            }
-                        }
-                        glib::Propagation::Stop
-                    } else {
-                        glib::Propagation::Proceed
-                    }
+                    glib::Propagation::Proceed
                 }
             });
             self.window.add_controller(key_ctrl);
         }
     }
 
-    pub fn go_back(&self) {
-        BACK_ANIM.store(true, std::sync::atomic::Ordering::SeqCst);
+    /// Yan ray gezinmesi: farklı sayfaysa history'e ekle + göster.
+    /// (Lowell sidebar uyarlaması.)
+    pub fn navigate_to(&self, p: &Page) {
+        {
+            let mut st = self.page_history.borrow_mut();
+            if st.last() != Some(p) {
+                st.push(p.clone());
+            }
+        }
+        self.show_page(p);
+        if matches!(p, Page::Home) {
+            self.fetch_home();
+        }
+    }
+
+    /// Yan ray seçim vurgusu (Lowell birebir: detay → Ana Sayfa vurgusu).
+    pub fn update_sidebar_selection(&self, page: &Page) {
+        let sel: Option<Page> = match page {
+            Page::Home | Page::Episodes { .. } | Page::Movie { .. } => Some(Page::Home),
+            Page::Favs => Some(Page::Favs),
+            Page::Marathon => Some(Page::Marathon),
+            Page::History => Some(Page::History),
+            Page::Downloads => Some(Page::Downloads),
+            Page::Settings => Some(Page::Settings),
+            Page::Kesfet => Some(Page::Kesfet),
+            Page::Calendar => Some(Page::Calendar),
+            Page::News => Some(Page::News),
+            _ => None,
+        };
+        for (p, btn, _, _) in self.sidebar_rows.borrow().iter() {
+            if Some(p) == sel.as_ref() {
+                btn.add_css_class("side-selected");
+            } else {
+                btn.remove_css_class("side-selected");
+            }
+        }
+    }
+
+    /// Daralt/genişlet (Lowell apply_sidebar birebir: kutu genişliği +
+    /// marjlar + satır içi hizalama; iconsuz/login yok bizde).
+    pub fn apply_sidebar_collapsed(&self) {
+        let collapsed = self.sidebar_collapsed.get();
+        self.sidebar_box.set_size_request(if collapsed { 58 } else { 164 }, -1);
+        self.sidebar_box.set_margin_start(if collapsed { 3 } else { 8 });
+        self.sidebar_box.set_margin_end(if collapsed { 3 } else { 4 });
+        for (_, btn, lbl, full) in self.sidebar_rows.borrow().iter() {
+            let inner = btn.child().and_downcast::<gtk::Box>();
+            if collapsed {
+                if !btn.has_css_class("side-dock") {
+                    btn.add_css_class("side-dock");
+                }
+                // Dock modunda yalnızca ikon göster; metin tooltip'te kalır.
+                lbl.set_visible(false);
+                lbl.set_text("");
+                if let Some(img) = inner
+                    .as_ref()
+                    .and_then(|b| b.first_child())
+                    .and_then(|w| w.downcast::<gtk::Image>().ok())
+                {
+                    // Dock disiplini (Lowell137/animecix-linux birebir): 18px.
+                    img.set_pixel_size(18);
+                    img.set_halign(gtk::Align::Center);
+                }
+                if let Some(ref inner) = inner {
+                    inner.set_spacing(0);
+                    inner.set_halign(gtk::Align::Center);
+                    inner.set_margin_start(0);
+                    inner.set_margin_end(0);
+                    inner.set_margin_top(6);
+                    inner.set_margin_bottom(6);
+                }
+            } else {
+                btn.remove_css_class("side-dock");
+                if let Some(img) = inner
+                    .as_ref()
+                    .and_then(|b| b.first_child())
+                    .and_then(|w| w.downcast::<gtk::Image>().ok())
+                {
+                    // Normal mod: tema varsayılanı (Lowell `-1` birebir, ~16px).
+                    img.set_pixel_size(-1);
+                    img.set_halign(gtk::Align::Fill);
+                }
+                lbl.set_visible(true);
+                lbl.set_xalign(0.0);
+                lbl.set_text(full);
+                if let Some(inner) = inner {
+                    inner.set_spacing(10);
+                    inner.set_halign(gtk::Align::Fill);
+                    inner.set_margin_start(10);
+                    inner.set_margin_end(10);
+                    inner.set_margin_top(6);
+                    inner.set_margin_bottom(6);
+                }
+            }
+        }
+    }
+
+    pub fn go_back(&self) {        BACK_ANIM.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut st = self.page_history.borrow_mut();        if st.len() > 1 {
             st.pop();
             while st.len() > 1 && st.last() == st.get(st.len() - 2) {
@@ -615,31 +1108,39 @@ impl App {
     }
 
     pub fn refresh_internet_status(&self) {
-        // Ana sayfayı yeniden inşa eder; build_home_view yeniden kontrol eder
+        // Taze kontrol arka planda yapılır; bitince ana sayfa yeniden
+        // inşa edilir (iş bitmeden UI bloklanmaz).
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let st = crate::api::check_internet();
+            store_internet_status(st);
+            let _ = tx.send(());
+        });
         let stack = self.stack.clone();
         let this = self.clone_ref();
-        glib::timeout_add_local_once(
-            std::time::Duration::from_millis(50),
-            move || {
+        glib::idle_add_local(move || match rx.try_recv() {
+            Ok(()) => {
                 let widget = this.build_home_view();
                 if let Some(prev) = stack.child_by_name("home") {
                     stack.remove(&prev);
                 }
                 stack.add_named(&widget, Some("home"));
                 stack.set_visible_child_name("home");
-            },
-        );
+                glib::ControlFlow::Break
+            }
+            Err(_) => glib::ControlFlow::Continue,
+        });
     }
 
     fn apply_ui_scale(&self) {
-        let s = self.settings.borrow().ui_scale;
+        let s = self.settings.borrow().ui_scale.clamp(1.0, 1.25);
         self.window.remove_css_class("ui-scale-125");
         self.window.remove_css_class("ui-scale-150");
-        if (s - 1.25).abs() < 0.01 {
-            self.window.add_css_class("ui-scale-125");
-        } else if s >= 1.4 {
-            self.window.add_css_class("ui-scale-150");
-        }
+        // Sürekli değer: kalıcı provider'a pencere taban fontu yazılır
+        // (16px taban; eski kademeli sınıflar kalktı, %150 migrate edilir).
+        let px = (16.0 * s).round() as i32;
+        self.scale_css
+            .load_from_data(&format!("window {{ font-size: {px}px; }}"));
     }
 
     fn apply_movie_tint(&self, target: &gtk::Box, poster: Option<&str>) {
@@ -716,7 +1217,10 @@ impl App {
                     let mut cur = stack_c.first_child();
                     while let Some(child) = cur {
                         let next = child.next_sibling();
-                        if child != visible {
+                        // Ev view-cache'lenir: kirlenince zaten yeniden kurulur.
+                        let keep = child == visible
+                            || stack_c.child_by_name("home").as_ref() == Some(&child);
+                        if !keep {
                             to_rm.push(child);
                         }
                         cur = next;
@@ -735,7 +1239,14 @@ impl App {
             }
             Page::Home => {
                 self.title_label.set_text("AnimeciX");
-                switch(&self.stack, "home", gtk::StackTransitionType::Crossfade, self.build_home_view());
+                // View-cache: ev zaten kurulu ve kirlenmediyse rebuild yok
+                // (dönüşlerde kapaklar anında gelir).
+                if self.stack.child_by_name("home").is_some() && !self.home_dirty.get() {
+                    self.stack.set_visible_child_name("home");
+                } else {
+                    self.home_dirty.set(false);
+                    switch(&self.stack, "home", gtk::StackTransitionType::Crossfade, self.build_home_view());
+                }
             }
             Page::Favs => {
                 self.title_label.set_text("Favorilerim");
@@ -753,6 +1264,18 @@ impl App {
                 self.title_label.set_text("İndirilenler");
                 switch(&self.stack, "downloads", gtk::StackTransitionType::Crossfade, self.build_downloads_view());
             }
+            Page::Kesfet => {
+                self.title_label.set_text("Keşfet");
+                switch(&self.stack, "kesfet", gtk::StackTransitionType::Crossfade, self.build_kesfet_view());
+            }
+            Page::Calendar => {
+                self.title_label.set_text("Yayın Takvimi");
+                switch(&self.stack, "calendar", gtk::StackTransitionType::Crossfade, self.build_calendar_view());
+            }
+            Page::News => {
+                self.title_label.set_text("Haberler");
+                switch(&self.stack, "news", gtk::StackTransitionType::Crossfade, self.build_news_view());
+            }
             Page::Settings => {
                 self.title_label.set_text("Ayarlar");
                 switch(&self.stack, "settings", gtk::StackTransitionType::Crossfade, self.build_settings_view());
@@ -769,6 +1292,8 @@ impl App {
         }
 
         // Odak iadesi: PgUp/PgDn/ok tuşları odak ister, hover yetmez.
+        // Yan ray vurgusunu da tazele.
+        self.update_sidebar_selection(page);
         // Geçiş sonrası odak ölü widget/header'da kalırsa tuşlar boşa düşer.
         let stack_c = self.stack.clone();
         glib::idle_add_local_once(move || {
@@ -805,6 +1330,9 @@ impl App {
                 if let Some(val) = it.next() {
                     self.goto_page(val);
                 }
+            } else if let Some(val) = a.strip_prefix("--goto=") {
+                // main.rs her iki formu da GTK'dan gizler; burada ikisi de anlaşılır.
+                self.goto_page(val);
             }
         }
     }
@@ -845,10 +1373,7 @@ impl App {
                 self.page_history.borrow_mut().push(Page::Home);
                 self.show_page(&Page::Home);
                 self.fetch_home();
-                self.search_bar.set_search_mode(true);
-                self.search_entry.set_text("Tokyo");
-                let q = self.search_entry.text().to_string();
-                self.do_search(q);
+                self.do_search("Tokyo".to_string());
             }
             "episodes" => {
                 self.page_history.borrow_mut().push(Page::Home);
@@ -873,7 +1398,7 @@ impl App {
         let this = self.clone_ref();
         let this_t = self.clone_ref();
         let this_p = self.clone_ref();
-        crate::ui::welcome::WelcomeView::build(
+        let view = crate::ui::welcome::WelcomeView::build(
             &settings,
             move |new_s| {
                 this.client.save_settings(&new_s);
@@ -893,37 +1418,87 @@ impl App {
             move |theme_id| {
                 crate::theme::apply_theme(&this_p.window, &theme_id);
             },
-        )
+        );
+        // Döngü kırıcı: görünüm kurulduysa bir daha zorla gösterme.
+        // (Buton/Atla/Esc sadece Home'a geçirir.)
+        self.client.set_welcome_seen(true);
+        view
     }
 
     /// Başlık kartı (kapak hemen yüklenir).
     fn create_title_card(&self, t: &Title) -> gtk::Box {
-        let box_ = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        self.create_title_card_sized(t, 140)
+    }
+
+    /// Boyut parametreli kart (ev/devam kuantumu; arama/keşfet 140 sabit).
+    /// Kart disiplini (Lowell poster_card birebir): sabit boy, başlık tek
+    /// satır, alt yazı boşsa hayalet " ".
+    fn create_title_card_sized(&self, t: &Title, w: i32) -> gtk::Box {
+        self.create_title_card_sub(t, w, None)
+    }
+
+    /// Alt yazısı ezilebilir kart: devam rafı SxxExx rozetini buradan verir,
+    /// geometri normal kartla birebir aynı kalır (hiza kayması olmaz).
+    fn create_title_card_sub(
+        &self,
+        t: &Title,
+        w: i32,
+        sub_override: Option<String>,
+    ) -> gtk::Box {
+        let h = w * 3 / 2;
+        let mwc = (w * 16 / 140).max(16);
+        let box_ = gtk::Box::new(gtk::Orientation::Vertical, 4);
         box_.add_css_class("title-btn");
-        box_.set_size_request(140, -1);
+        box_.set_size_request(w, h + 60);
         box_.set_hexpand(false);
         box_.set_vexpand(false);
         box_.set_halign(gtk::Align::Start);
         box_.set_valign(gtk::Align::Start);
 
-        let pic = self.covers.cover_picture(t.poster.as_deref(), 140, 210);
-        pic.set_size_request(140, 210);
+        let pic = self.covers.cover_picture(t.poster.as_deref(), w, h);
+        pic.set_size_request(w, h);
         pic.set_can_shrink(false);
         pic.set_hexpand(false);
         pic.set_vexpand(false);
-        pic.set_halign(gtk::Align::Start);
+        pic.set_halign(gtk::Align::Center);
+        // Poster-lift (Lowell137/animecix-linux uyarlaması): hoverda kart
+        // yerinden oynamaz, yalnız poster 3px kalkar.
+        pic.add_css_class("poster-lift");
+        let motion = gtk::EventControllerMotion::new();
+        let pic_enter = pic.clone();
+        motion.connect_enter(move |_, _, _| {
+            pic_enter.add_css_class("lifted");
+        });
+        let pic_leave = pic.clone();
+        motion.connect_leave(move |_| {
+            pic_leave.remove_css_class("lifted");
+        });
+        pic.add_controller(motion);
 
         let lbl = gtk::Label::new(Some(&t.name));
         lbl.add_css_class("card-title");
-        lbl.set_wrap(true);
-        lbl.set_justify(gtk::Justification::Center);
+        lbl.set_wrap(false);
+        lbl.set_single_line_mode(true);
+        lbl.set_lines(1);
+        lbl.set_max_width_chars(mwc);
         lbl.set_xalign(0.5);
-        lbl.set_max_width_chars(16);
-        lbl.set_lines(2);
         lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
 
         box_.append(&pic);
         box_.append(&lbl);
+        // Alt yazı: ezme varsa o (devam rafı SxxExx), yoksa anlamlı
+        // tür/yıl/tip (yükseklik sabit kalır).
+        let sub = gtk::Label::new(Some(
+            &sub_override.unwrap_or_else(|| t.card_subtitle()),
+        ));
+        sub.add_css_class("dim-label");
+        sub.set_wrap(false);
+        sub.set_single_line_mode(true);
+        sub.set_lines(1);
+        sub.set_max_width_chars(mwc + 2);
+        sub.set_xalign(0.5);
+        sub.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        box_.append(&sub);
 
         let gesture = gtk::GestureClick::new();
         let this = self.clone_ref();
@@ -936,6 +1511,249 @@ impl App {
         box_
     }
 
+    /// Spotlight hero: ilk kategoriden en fazla 8 başlık (Lowell birebir:
+    /// pencere-göreli yükseklik, kısa tür satırı, 90 karakter açıklama,
+    /// yuvarlak klip, tekerlek kapalı). Resimsiz havuzda None.
+    fn build_spotlight(&self, items: &[Title]) -> Option<gtk::Box> {
+        let picks = pick_spotlight(items, 8, spot_seed());
+        self.build_spotlight_picks(&picks)
+    }
+
+    /// Seçilmiş listeden hero kurar (skeleton takası da bu gövdeyi kullanır).
+    fn build_spotlight_picks(&self, picks: &[Title]) -> Option<gtk::Box> {
+        let h = self.hero_h.get();
+        let carousel = adw::Carousel::new();
+        carousel.set_allow_mouse_drag(true);
+        carousel.set_allow_scroll_wheel(false);
+        carousel.set_hexpand(true);
+        let mut count = 0u32;
+        for t in picks.iter().take(8) {
+            let Some(url) = t.backdrop.clone().or_else(|| t.poster.clone()) else {
+                continue;
+            };
+            let pic = gtk::Picture::new();
+            pic.set_content_fit(gtk::ContentFit::Cover);
+            pic.set_hexpand(true);
+            pic.set_width_request(-1);
+            pic.set_height_request(h);
+            self.covers.load_cover(Some(&url), &pic, 1280, h);
+
+            let shade = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            shade.add_css_class("hero-shade");
+            shade.set_hexpand(true);
+            shade.set_vexpand(true);
+
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+            content.set_valign(gtk::Align::End);
+            content.set_margin_start(20);
+            content.set_margin_end(20);
+            content.set_margin_bottom(18);
+            // Rozet: anlamlı ilk tür.
+            if let Some(g0) = t.display_genre() {
+                let badge = gtk::Label::new(Some(&g0));
+                badge.add_css_class("detail-badge");
+                badge.set_xalign(0.0);
+                content.append(&badge);
+            }
+            let title = gtk::Label::new(Some(&t.display_name()));
+            title.add_css_class("title-1");
+            title.add_css_class("hero-text");
+            title.set_xalign(0.0);
+            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            content.append(&title);
+            // Kısa tür satırı: anlamlı tür + yıl.
+            let genre_year = match (t.display_genre(), t.year) {
+                (Some(g), Some(y)) => {
+                    format!("{g} · {y}")
+                }
+                (Some(g), None) => g,
+                (None, Some(y)) => y.to_string(),
+                (None, None) => String::new(),
+            };
+            if !genre_year.is_empty() {
+                let gl = gtk::Label::new(Some(&genre_year));
+                gl.add_css_class("hero-genre");
+                gl.set_xalign(0.0);
+                gl.set_single_line_mode(true);
+                gl.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                content.append(&gl);
+            }
+            // Açıklama: 90 karakter kesik.
+            if let Some(d) = t.description.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty()) {
+                let cut: String = d.chars().take(90).collect();
+                let dl = gtk::Label::new(Some(&cut));
+                dl.add_css_class("hero-text");
+                dl.add_css_class("dim-label");
+                dl.set_xalign(0.0);
+                dl.set_wrap(true);
+                dl.set_lines(2);
+                dl.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                content.append(&dl);
+            }
+            let watch = gtk::Button::with_label("▶ İzle");
+            watch.add_css_class("pill");
+            watch.add_css_class("suggested-action");
+            watch.set_halign(gtk::Align::Start);
+            let this = self.clone_ref();
+            let tt = t.clone();
+            watch.connect_clicked(move |_| {
+                this.open_episodes(tt.clone());
+            });
+            content.append(&watch);
+
+            let overlay = gtk::Overlay::new();
+            overlay.add_css_class("hero-clip");
+            // Sayfa viewportu doldurur (komşu kart taşması kapanır;
+            // tam ekranda otomatik genişler).
+            overlay.set_hexpand(true);
+            overlay.set_halign(gtk::Align::Fill);
+            overlay.set_size_request(-1, h);
+            overlay.set_child(Some(&pic));
+            overlay.add_overlay(&shade);
+            overlay.add_overlay(&content);
+            carousel.append(&overlay);
+            count += 1;
+        }
+        if count == 0 {
+            return None;
+        }
+        // 6sn oto-dönüş; sayfa değişince (ebeveyn yok) timer ölür.
+        let car_c = carousel.clone();
+        glib::timeout_add_local(std::time::Duration::from_secs(6), move || {
+            if car_c.parent().is_none() {
+                return glib::ControlFlow::Break;
+            }
+            let n = car_c.n_pages();
+            if n > 1 {
+                let next = car_c.position() as u32 + 1;
+                let page = car_c.nth_page(if next >= n { 0 } else { next });
+                car_c.scroll_to(&page, true);
+            }
+            glib::ControlFlow::Continue
+        });
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        root.set_hexpand(true);
+        root.set_halign(gtk::Align::Fill);
+        root.append(&carousel);
+        let dots = adw::CarouselIndicatorDots::new();
+        dots.set_carousel(Some(&carousel));
+        dots.set_halign(gtk::Align::Center);
+        root.append(&dots);
+        Some(root)
+    }
+
+    /// Skeleton + arka-plan bölüm ön-kontrolü: hero hemen nabız iskeletle
+    /// belirir; `episodes()` boş dönen aday sessizce düşer (hepsi düşerse
+    /// ham liste gösterilir, hero asla boş kalmaz). Eski görünüm yıkıldıysa
+    /// takas sessizce atlanır.
+    fn build_spotlight_async(&self, parent: &gtk::Box, items: &[Title]) {
+        let h = self.hero_h.get();
+        let skel = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        skel.set_hexpand(true);
+        skel.set_halign(gtk::Align::Fill);
+        let ph = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        ph.add_css_class("hero-skeleton");
+        ph.set_size_request(-1, h);
+        ph.set_hexpand(true);
+        ph.set_halign(gtk::Align::Fill);
+        skel.append(&ph);
+        parent.append(&skel);
+
+        let picks = pick_spotlight(items, 8, spot_seed());
+        if picks.is_empty() {
+            parent.remove(&skel);
+            return;
+        }
+        let raw = picks.clone();
+        let skel_w = skel.downgrade();
+        let client = self.client.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<Title>>();
+        std::thread::spawn(move || {
+            // Aday başına bir işçi: enrich + episodes, boşu ele.
+            // (Client paylaşımı Arc ile; scope/Sync gerekmez.)
+            let mut handles = Vec::new();
+            for t in picks {
+                let c = client.clone();
+                handles.push(std::thread::spawn(move || {
+                    let enriched = c.enrich_title(&t);
+                    match c.episodes(&enriched) {
+                        Ok(eps) if !eps.is_empty() => Some(t),
+                        _ => None,
+                    }
+                }));
+            }
+            let mut ok: Vec<Title> = Vec::new();
+            for hdl in handles {
+                if let Ok(Some(t)) = hdl.join() {
+                    ok.push(t);
+                }
+            }
+            let final_picks = if ok.is_empty() { raw } else { ok };
+            let _ = tx.send(final_picks);
+        });
+        // Takas UI tarafında: görünüm yıkıldıysa sessizce atlanır.
+        let this = self.clone_ref();
+        glib::idle_add_local(move || match rx.try_recv() {
+            Ok(final_picks) => {
+                if let Some(skel) = skel_w.upgrade() {
+                    if let Some(parent) = skel.parent().and_downcast::<gtk::Box>() {
+                        let prev = skel.prev_sibling();
+                        parent.remove(&skel);
+                        if let Some(view) = this.build_spotlight_picks(&final_picks) {
+                            parent.insert_child_after(&view, prev.as_ref());
+                        }
+                    }
+                }
+                glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        });
+    }
+
+    /// Devam rafı: son izlenenler (tekil başlık; tıklama detaya gider,
+    /// alt yazı SxxExx rozetidir).
+    /// (Lowell137/animecix-linux `continue_card` uyarlaması.)
+    fn build_continue_section(&self) -> Option<gtk::Box> {
+        let st = self.client.load_state();
+        let mut seen = std::collections::HashSet::new();
+        let mut items: Vec<(Title, crate::api::Episode)> = Vec::new();
+        for h in st.history.iter() {
+            if seen.insert(h.title.id) {
+                items.push((h.title.clone(), h.episode.clone()));
+            }
+            if items.len() >= 6 {
+                break;
+            }
+        }
+        if items.is_empty() {
+            return None;
+        }
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let cw = self.card_w.get();
+        let (head, wire) = build_shelf_pager("▶ Devam Et", items.len(), self.grid_cols.get() as usize);
+        root.append(&head);
+
+        let flow = gtk::FlowBox::new();
+        flow.set_halign(gtk::Align::Center);
+        flow.set_valign(gtk::Align::Start);
+        flow.set_selection_mode(gtk::SelectionMode::None);
+        flow.set_activate_on_single_click(false);
+        flow.set_column_spacing(16);
+        flow.set_row_spacing(20);
+        flow.set_max_children_per_line(self.grid_cols.get());
+        flow.set_min_children_per_line(1);
+        // Normal kart şablonu + SxxExx alt yazısı: hover-play overlay
+        // kalktı (tıklama zaten detaya gider), geometri raflarla eşit.
+        for (t, ep) in items {
+            let sub = format!("S{:02}E{:02}", ep.season, ep.episode);
+            flow.append(&self.create_title_card_sub(&t, cw, Some(sub)));
+        }
+        wire(&flow);
+        root.append(&flow);
+        Some(root)
+    }
+
     fn build_home_view(&self) -> gtk::ScrolledWindow {
         let scroll = gtk::ScrolledWindow::new();
         scroll.add_css_class("clear-scroll");
@@ -945,8 +1763,9 @@ impl App {
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         scroll.set_child(Some(&outer));
 
-        // İnternet bağlantı uyarısı (offline ise; 60sn önbellekli, geri-dönüş donmaz).
-        match cached_internet_status() {
+        // İnternet bağlantı uyarısı (önbellek soğuksa iyimser geçilir;
+        // gerçek durum warmer thread ile gelip görünümü tazeler).
+        match internet_cached().unwrap_or(crate::api::InternetStatus::Online) {
             crate::api::InternetStatus::Online => {}
             crate::api::InternetStatus::Offline { reason: _ } => {
                 let banner = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -999,30 +1818,24 @@ impl App {
         main_box.set_margin_start(12);
         main_box.set_margin_end(12);
 
-        // Hızlı arama hapı: ortada, ilk rafın üstünde.
-        {
-            let pill = gtk::SearchEntry::new();
-            pill.add_css_class("tools-search-pill");
-            pill.set_placeholder_text(Some("Hızlı ara… (Enter)"));
-            pill.set_halign(gtk::Align::Center);
-            let this = self.clone_ref();
-            pill.connect_activate(move |e| {
-                let q = e.text().to_string();
-                if !q.trim().is_empty() {
-                    this.do_search(q);
-                }
-            });
-            main_box.append(&pill);
+        // Spotlight hero: iskelet hemen, doğrulanmış 8'li sonra
+        // (bölümsüz aday arka-planda elenir).
+        if !cats.is_empty() {
+            let pool = hero_pool(&cats);
+            self.build_spotlight_async(&main_box, &pool);
         }
 
-        for cat in cats.iter() {
-            let shelf_title = gtk::Label::new(Some(&cat.name));
-            shelf_title.add_css_class("shelf-title");
-            shelf_title.set_xalign(0.0);
-            shelf_title.set_margin_start(4);
-            shelf_title.set_margin_bottom(4);
-            main_box.append(&shelf_title);
+        // Devam rafı: spotlight ile raflar arası.
+        if let Some(cont) = self.build_continue_section() {
+            main_box.append(&cont);
+        }
 
+        // Raflar kuantum boyda: PER = sütun x 2 (her genişlikte 2 satır).
+        let per_home = (self.grid_cols.get() * 2).max(2) as usize;
+        let card_w = self.card_w.get();
+        for cat in cats.iter() {
+            let (head, wire) = build_shelf_pager(&cat.name, cat.items.len(), per_home);
+            main_box.append(&head);
             let flow = gtk::FlowBox::new();
             flow.set_halign(gtk::Align::Center);
             flow.set_valign(gtk::Align::Start);
@@ -1030,11 +1843,12 @@ impl App {
             flow.set_activate_on_single_click(false);
             flow.set_column_spacing(16);
             flow.set_row_spacing(20);
-
+            flow.set_max_children_per_line(self.grid_cols.get());
+            flow.set_min_children_per_line(1);
             for t in &cat.items {
-                let btn = self.create_title_card(t);
-                flow.append(&btn);
+                flow.append(&self.create_title_card_sized(t, card_w));
             }
+            wire(&flow);
             main_box.append(&flow);
         }
 
@@ -1356,7 +2170,8 @@ impl App {
                 this_save.apply_ui_scale();
                 crate::theme::apply_theme(&this_save.window, &new_s.theme);
                 if new_s.cover_quality != old_s.cover_quality {
-                    // Kalite değişimi restart ister: dialog → covers wipe → restart.
+                    // Kalite değişimi restart ister: dialog → bayrak + bellek
+                    // temizliği → restart; silme yeni proseste olur (yarış yok).
                     let dlg_app = this_save.clone_ref();
                     let dialog = adw::MessageDialog::builder()
                         .heading("Kapak Kalitesi Değişti")
@@ -1370,7 +2185,8 @@ impl App {
                     dialog.set_response_appearance("restart", adw::ResponseAppearance::Destructive);
                     dialog.connect_response(None, move |_, resp| {
                         if resp == "restart" {
-                            dlg_app.client.wipe_covers_dir();
+                            dlg_app.client.request_covers_wipe();
+                            dlg_app.covers.reset();
                             crate::restart_app();
                         } else {
                             // Vazgeç: eski ayarı geri yaz, sayfayı tazele.
@@ -1407,6 +2223,426 @@ impl App {
         );
 
         scroll.set_child(Some(&view));
+        scroll
+    }
+
+    /// Haberler: kart listesi + sayfalayıcı (Lowell uyarlaması).
+    fn build_news_view(&self) -> gtk::ScrolledWindow {
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.add_css_class("clear-scroll");
+        let cached = self.news.borrow().clone();
+        let Some((items, _total, last)) = cached else {
+            let sp = components::create_status_page(
+                "Yükleniyor…",
+                "Haberler getiriliyor.",
+                "view-list-symbolic",
+            );
+            scroll.set_child(Some(&sp));
+            return scroll;
+        };
+        if items.is_empty() {
+            let sp = components::create_status_page(
+                "Haber Yok",
+                "Şu anda gösterilecek haber bulunamadı.",
+                "view-list-symbolic",
+            );
+            scroll.set_child(Some(&sp));
+            return scroll;
+        }
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        root.set_margin_top(12);
+        root.set_margin_bottom(18);
+        root.set_margin_start(12);
+        root.set_margin_end(12);
+        for n in &items {
+            let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            card.add_css_class("card");
+            card.add_css_class("history-item-card");
+            card.set_margin_top(3);
+            card.set_margin_bottom(3);
+            if let Some(img_url) = n.image.clone().or_else(|| n.backdrop.clone()) {
+                let pic = self.covers.cover_picture(Some(&img_url), 120, 68);
+                pic.set_valign(gtk::Align::Center);
+                card.append(&pic);
+            }
+            let vb = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            vb.set_valign(gtk::Align::Center);
+            vb.set_hexpand(true);
+            let title = gtk::Label::new(Some(&n.title));
+            title.add_css_class("title-4");
+            title.set_xalign(0.0);
+            title.set_wrap(true);
+            title.set_lines(2);
+            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            vb.append(&title);
+            let date_txt = match crate::api::split_iso(&n.created_at) {
+                Some((y, m, d, hh, mm)) => {
+                    format!("{d:02}.{m:02}.{y} {hh:02}:{mm:02}")
+                }
+                None => n.created_at.clone(),
+            };
+            let date = gtk::Label::new(Some(&date_txt));
+            date.add_css_class("dim-label");
+            date.set_xalign(0.0);
+            vb.append(&date);
+            let more = gtk::Label::new(Some("Devamını oku →"));
+            more.add_css_class("dim-label");
+            more.set_xalign(0.0);
+            vb.append(&more);
+            card.append(&vb);
+            // Dokun → tam metin dialogu (tek tık: çoklu basış hem diyalog
+            // açıp hem gövdede select-all tetiklemesin).
+            let this = self.clone_ref();
+            let nn = n.clone();
+            let gesture = gtk::GestureClick::new();
+            gesture.connect_pressed(move |_, n_press, _, _| {
+                if n_press != 1 {
+                    return;
+                }
+                this.open_news_dialog(&nn);
+            });
+            card.add_controller(gesture);
+            root.append(&card);
+        }
+        // Sayfalayıcı.
+        let cur = self.news_page.get();
+        if last > 1 {
+            let pager = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            pager.set_halign(gtk::Align::Center);
+            pager.set_margin_top(8);
+            let prev_btn = gtk::Button::from_icon_name("go-previous-symbolic");
+            prev_btn.add_css_class("flat");
+            prev_btn.add_css_class("circular");
+            prev_btn.set_sensitive(cur > 1);
+            let next_btn = gtk::Button::from_icon_name("go-next-symbolic");
+            next_btn.add_css_class("flat");
+            next_btn.add_css_class("circular");
+            next_btn.set_sensitive(cur < last);
+            let lbl = gtk::Label::new(Some(&format!("{cur} / {last}")));
+            lbl.add_css_class("dim-label");
+            lbl.set_valign(gtk::Align::Center);
+            {
+                let this = self.clone_ref();
+                prev_btn.connect_clicked(move |_| {
+                    this.fetch_news(cur.saturating_sub(1).max(1));
+                });
+            }
+            {
+                let this = self.clone_ref();
+                next_btn.connect_clicked(move |_| {
+                    this.fetch_news(cur + 1);
+                });
+            }
+            pager.append(&prev_btn);
+            pager.append(&lbl);
+            pager.append(&next_btn);
+            root.append(&pager);
+        }
+        scroll.set_child(Some(&root));
+        scroll
+    }
+
+    /// Haber tam metin dialogu (satıra dokununca açılır).
+    pub fn open_news_dialog(&self, n: &api::NewsItem) {
+        let dlg = adw::Window::new();
+        dlg.set_title(Some("Haber"));
+        dlg.set_modal(true);
+        dlg.set_transient_for(Some(&self.window));
+        dlg.set_default_size(560, 600);
+
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let titlebar = adw::HeaderBar::new();
+        let title = adw::WindowTitle::new("Haber", "");
+        titlebar.set_title_widget(Some(&title));
+        root.append(&titlebar);
+
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_hexpand(true);
+        scroll.set_vexpand(true);
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        let body_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        body_box.set_margin_top(16);
+        body_box.set_margin_bottom(18);
+        body_box.set_margin_start(18);
+        body_box.set_margin_end(18);
+        if let Some(img_url) = n.image.clone().or_else(|| n.backdrop.clone()) {
+            let pic = self.covers.cover_picture(Some(&img_url), 480, 270);
+            pic.set_halign(gtk::Align::Center);
+            body_box.append(&pic);
+        }
+        let title_lbl = gtk::Label::new(Some(&n.title));
+        title_lbl.add_css_class("title-2");
+        title_lbl.set_xalign(0.0);
+        title_lbl.set_wrap(true);
+        body_box.append(&title_lbl);
+        let date_txt = match crate::api::split_iso(&n.created_at) {
+            Some((y, m, d, hh, mm)) => format!("{d:02}.{m:02}.{y} {hh:02}:{mm:02}"),
+            None => n.created_at.clone(),
+        };
+        let date = gtk::Label::new(Some(&date_txt));
+        date.add_css_class("dim-label");
+        date.set_xalign(0.0);
+        body_box.append(&date);
+        let body = gtk::Label::new(Some(n.body.trim()));
+        body.add_css_class(&format!("news-font-{}", self.settings.borrow().news_font_size));
+        body.set_xalign(0.0);
+        body.set_wrap(true);
+        body.set_selectable(true);
+        body_box.append(&body);
+        scroll.set_child(Some(&body_box));
+        root.append(&scroll);
+        dlg.set_content(Some(&root));
+        dlg.present();
+        // Açılışta seçim sıfırla (kopyalamaya izin ver, select-all gösterme).
+        let body_c = body.clone();
+        glib::idle_add_local_once(move || {
+            body_c.select_region(0, 0);
+        });
+    }
+
+    /// Yayın takvimi: gün başlıkları + bölüm satırları (Lowell uyarlaması).
+    fn build_calendar_view(&self) -> gtk::ScrolledWindow {
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.add_css_class("clear-scroll");
+        let cached = self.calendar.borrow().clone();
+        let Some(days) = cached else {
+            let sp = components::create_status_page(
+                "Yükleniyor…",
+                "Yayın takvimi getiriliyor.",
+                "x-office-calendar-symbolic",
+            );
+            scroll.set_child(Some(&sp));
+            return scroll;
+        };
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 14);
+        root.set_margin_top(12);
+        root.set_margin_bottom(18);
+        root.set_margin_start(12);
+        root.set_margin_end(12);
+        let mut any = false;
+        for day in &days {
+            if day.episodes.is_empty() {
+                continue;
+            }
+            any = true;
+            let head_txt = match crate::api::split_iso(&day.date) {
+                Some((y, m, d, _, _)) => format!("{d:02}.{m:02}.{y}"),
+                None => day.date.clone(),
+            };
+            let head = gtk::Label::new(Some(&head_txt));
+            head.add_css_class("shelf-title");
+            head.set_xalign(0.0);
+            head.set_margin_start(4);
+            root.append(&head);
+            for ce in &day.episodes {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                row.add_css_class("history-item-card");
+                row.set_margin_top(3);
+                row.set_margin_bottom(3);
+                row.set_margin_start(4);
+                row.set_margin_end(4);
+                let poster = ce.poster.clone().or_else(|| ce.title.poster.clone());
+                let pic = self.covers.cover_picture(poster.as_deref(), 96, 54);
+                pic.set_valign(gtk::Align::Center);
+                row.append(&pic);
+                let vb = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                vb.set_valign(gtk::Align::Center);
+                vb.set_hexpand(true);
+                let name = gtk::Label::new(Some(&format!(
+                    "{} S{:02}E{:02} · {}",
+                    ce.title.name, ce.season, ce.episode, ce.name
+                )));
+                name.add_css_class("title-4");
+                name.set_xalign(0.0);
+                name.set_single_line_mode(true);
+                name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                vb.append(&name);
+                let time_txt = match crate::api::split_iso(&ce.release_date) {
+                    Some((_, _, _, hh, mm)) => format!("{hh:02}:{mm:02}"),
+                    None => String::new(),
+                };
+                if !time_txt.is_empty() {
+                    let tm = gtk::Label::new(Some(&time_txt));
+                    tm.add_css_class("dim-label");
+                    tm.set_xalign(0.0);
+                    vb.append(&tm);
+                }
+                row.append(&vb);
+                let t = ce.title.clone();
+                let this = self.clone_ref();
+                let gesture = gtk::GestureClick::new();
+                gesture.connect_pressed(move |_, _, _, _| {
+                    this.open_episodes(t.clone());
+                });
+                row.add_controller(gesture);
+                root.append(&row);
+            }
+        }
+        if !any {
+            let sp = components::create_status_page(
+                "Takvim Boş",
+                "Bu hafta yayınlanan bölüm bulunamadı.",
+                "x-office-calendar-symbolic",
+            );
+            scroll.set_child(Some(&sp));
+            return scroll;
+        }
+        scroll.set_child(Some(&root));
+        scroll
+    }
+
+    /// Keşfet: tip/sıra filtresi + ızgara + sayfalayıcı (Lowell uyarlaması).
+    fn build_kesfet_view(&self) -> gtk::ScrolledWindow {
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.add_css_class("clear-scroll");
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        root.set_margin_top(12);
+        root.set_margin_bottom(18);
+        root.set_margin_start(12);
+        root.set_margin_end(12);
+
+        // Filtre çubuğu.
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        bar.set_valign(gtk::Align::Center);
+        let type_list = gtk::StringList::new(&["Tümü", "Anime", "Film"]);
+        let type_drop = gtk::DropDown::new(Some(type_list), None::<gtk::Expression>);
+        type_drop.set_tooltip_text(Some("Tür"));
+        type_drop.set_valign(gtk::Align::Center);
+        let order_list = gtk::StringList::new(
+            &crate::api::DISCOVER_ORDERS
+                .iter()
+                .map(|(l, _)| *l)
+                .collect::<Vec<_>>(),
+        );
+        let order_drop = gtk::DropDown::new(Some(order_list), None::<gtk::Expression>);
+        order_drop.set_tooltip_text(Some("Sıralama"));
+        order_drop.set_valign(gtk::Align::Center);
+        let stream_check = gtk::CheckButton::with_label("Sadece izlenebilenler");
+        stream_check.set_valign(gtk::Align::Center);
+        let apply_btn = gtk::Button::with_label("Filtrele");
+        apply_btn.add_css_class("suggested-action");
+        apply_btn.set_valign(gtk::Align::Center);
+        // Mevcut filtreyi kontrollere yansıt.
+        {
+            let f = self.discover_filter.borrow();
+            type_drop.set_selected(match f.title_type.as_deref() {
+                Some("anime") => 1,
+                Some("movie") => 2,
+                _ => 0,
+            });
+            let oi = crate::api::DISCOVER_ORDERS
+                .iter()
+                .position(|(_, o)| f.order.as_deref() == *o)
+                .unwrap_or(0) as u32;
+            order_drop.set_selected(oi);
+            stream_check.set_active(f.only_streamable);
+        }
+        bar.append(&type_drop);
+        bar.append(&order_drop);
+        bar.append(&stream_check);
+        bar.append(&apply_btn);
+        root.append(&bar);
+        {
+            let this = self.clone_ref();
+            let type_drop_c = type_drop.clone();
+            let order_drop_c = order_drop.clone();
+            let stream_check_c = stream_check.clone();
+            apply_btn.connect_clicked(move |_| {
+                {
+                    let mut f = this.discover_filter.borrow_mut();
+                    f.title_type = match type_drop_c.selected() {
+                        1 => Some("anime".to_string()),
+                        2 => Some("movie".to_string()),
+                        _ => None,
+                    };
+                    f.order = crate::api::DISCOVER_ORDERS
+                        .get(order_drop_c.selected() as usize)
+                        .and_then(|(_, o)| *o)
+                        .map(|s| s.to_string());
+                    f.only_streamable = stream_check_c.is_active();
+                    f.page = 1;
+                }
+                *this.discover.borrow_mut() = None;
+                this.fetch_discover();
+            });
+        }
+
+        let cached = self.discover.borrow().clone();
+        let Some((items, total, last)) = cached else {
+            let sp = components::create_status_page(
+                "Yükleniyor…",
+                "Keşfet sonuçları getiriliyor.",
+                "view-grid-symbolic",
+            );
+            scroll.set_child(Some(&sp));
+            return scroll;
+        };
+        let counter = gtk::Label::new(Some(&format!("{total} başlık")));
+        counter.add_css_class("dim-label");
+        counter.set_xalign(1.0);
+        counter.set_margin_end(4);
+        root.append(&counter);
+
+        let flow = gtk::FlowBox::new();
+        flow.set_halign(gtk::Align::Center);
+        flow.set_valign(gtk::Align::Start);
+        flow.set_selection_mode(gtk::SelectionMode::None);
+        flow.set_activate_on_single_click(false);
+        flow.set_column_spacing(16);
+        flow.set_row_spacing(20);
+        // Ev kuantumu: büyük kapaklar + sütun disiplini (arama 140 kalır).
+        flow.set_max_children_per_line(self.grid_cols.get());
+        flow.set_min_children_per_line(1);
+        let cw = self.card_w.get();
+        for t in &items {
+            flow.append(&self.create_title_card_sized(t, cw));
+        }
+        root.append(&flow);
+
+        let cur = self.discover_filter.borrow().page.max(1);
+        if last > 1 {
+            let pager = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            pager.set_halign(gtk::Align::Center);
+            pager.set_margin_top(8);
+            let prev_btn = gtk::Button::from_icon_name("go-previous-symbolic");
+            prev_btn.add_css_class("flat");
+            prev_btn.add_css_class("circular");
+            prev_btn.set_sensitive(cur > 1);
+            let next_btn = gtk::Button::from_icon_name("go-next-symbolic");
+            next_btn.add_css_class("flat");
+            next_btn.add_css_class("circular");
+            next_btn.set_sensitive(cur < last);
+            let lbl = gtk::Label::new(Some(&format!("{cur} / {last}")));
+            lbl.add_css_class("dim-label");
+            lbl.set_valign(gtk::Align::Center);
+            {
+                let this = self.clone_ref();
+                prev_btn.connect_clicked(move |_| {
+                    {
+                        let mut f = this.discover_filter.borrow_mut();
+                        f.page = f.page.saturating_sub(1).max(1);
+                    }
+                    *this.discover.borrow_mut() = None;
+                    this.fetch_discover();
+                });
+            }
+            {
+                let this = self.clone_ref();
+                next_btn.connect_clicked(move |_| {
+                    {
+                        let mut f = this.discover_filter.borrow_mut();
+                        f.page += 1;
+                    }
+                    *this.discover.borrow_mut() = None;
+                    this.fetch_discover();
+                });
+            }
+            pager.append(&prev_btn);
+            pager.append(&lbl);
+            pager.append(&next_btn);
+            root.append(&pager);
+        }
+        scroll.set_child(Some(&root));
         scroll
     }
 
@@ -1448,6 +2684,7 @@ impl App {
 
     fn build_episodes_view(&self, title: &Title, eps: &[Episode]) -> gtk::Overlay {
         let scroll = gtk::ScrolledWindow::new();
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         scroll.add_css_class("clear-scroll");
 
         let is_movie = title.title_type.as_deref() == Some("movie")
@@ -1469,7 +2706,7 @@ impl App {
             let t_clone_mar = title.clone();
             marathon_btn.connect_clicked(move |b| {
                 let added = this_mar.client.toggle_marathon(&t_clone_mar);
-                b.set_icon_name(if added { "media-playlist-repeat-symbolic" } else { "flag-symbolic" });
+                b.set_icon_name(if added { "media-playlist-repeat-symbolic" } else { "bookmark-new-symbolic" });
                 b.set_tooltip_text(Some(if added { "Maratondan Çıkar" } else { "İzleme Maratonuna Ekle" }));
                 let msg = if added { "🏆 İzleme Maratonuna eklendi!" } else { "İzleme Maratonundan çıkarıldı" };
                 let toast = adw::Toast::new(msg);
@@ -1578,7 +2815,7 @@ impl App {
         let t_clone_mar = title.clone();
         marathon_btn.connect_clicked(move |b| {
             let added = this_mar.client.toggle_marathon(&t_clone_mar);
-            b.set_icon_name(if added { "media-playlist-repeat-symbolic" } else { "flag-symbolic" });
+            b.set_icon_name(if added { "media-playlist-repeat-symbolic" } else { "bookmark-new-symbolic" });
             b.set_tooltip_text(Some(if added { "Maratondan Çıkar" } else { "İzleme Maratonuna Ekle" }));
             let msg = if added { "🏆 İzleme Maratonuna eklendi!" } else { "İzleme Maratonundan çıkarıldı" };
             let toast = adw::Toast::new(msg);
@@ -1776,7 +3013,6 @@ impl App {
 
                 let triggered = match shortcut_key.as_str() {
                     "Ctrl+F" => is_ctrl && (key_name == "f" || key_name == "F"),
-                    "Ctrl+K" => is_ctrl && (key_name == "k" || key_name == "K"),
                     "F3" => key_name == "F3",
                     _ => key_name == "slash" || key_name == "kp_divide",
                 };
@@ -1797,6 +3033,20 @@ impl App {
         }
         drop(settings);
 
+        // Sezon + izlenme filtre çubuğu (satırlar kurulunca dolar;
+        // boş listede gösterilmez).
+        let mut seasons: Vec<u64> = eps.iter().map(|e| e.season).collect();
+        seasons.sort_unstable();
+        seasons.dedup();
+        let filter_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        filter_bar.set_margin_start(12);
+        filter_bar.set_margin_end(12);
+        filter_bar.set_margin_bottom(8);
+        filter_bar.set_valign(gtk::Align::Center);
+        if !eps.is_empty() {
+            root.append(&filter_bar);
+        }
+
         let list_box = gtk::ListBox::new();
         list_box.add_css_class("content-list");
         list_box.set_margin_start(12);
@@ -1813,7 +3063,7 @@ impl App {
         } else {
             // Tek disk okuma: satır başına load_state() donmayı önler.
             let watched_all = self.client.load_state().watched;
-            let rows: Vec<(Episode, gtk::Box)> = eps.iter().map(|e| {
+            let rows: Vec<(Episode, gtk::Box, Rc<RefCell<bool>>)> = eps.iter().map(|e| {
                 let key = format!("{}:{}:{}", title.id, e.season, e.episode);
 
                 let name = gtk::Label::new(Some(&format!(
@@ -2040,30 +3290,233 @@ impl App {
                 });
                 row.add_controller(right_click);
 
-                (e.clone(), row)
+                (e.clone(), row, is_watched.clone())
             }).collect();
 
-            for (_, row_widget) in &rows {
+            for (_, row_widget, _) in &rows {
                 list_box.append(row_widget);
             }
 
+/// Bölüm satırı görünürlüğü: iç kutuyla birlikte otomatik sarılan
+/// `ListBoxRow` sarmalayıcıyı da gizler (yoksa boş çizgili bant kalır).
+fn set_ep_row_visible(inner: &gtk::Box, visible: bool) {
+    inner.set_visible(visible);
+    if let Some(p) = inner.parent() {
+        if p.is::<gtk::ListBoxRow>() {
+            p.set_visible(visible);
+        }
+    }
+}
+
             let rows_rc = Rc::new(rows);
-            ep_search_entry.connect_search_changed(move |e| {
-                let query = e.text().trim().to_lowercase();
-                for (ep_data, row_widget) in rows_rc.iter() {
-                    if query.is_empty() {
-                        row_widget.set_visible(true);
-                    } else {
-                        let name_match = ep_data.name.to_lowercase().contains(&query);
-                        let ep_num_match = ep_data.episode.to_string() == query
-                            || format!("e{}", ep_data.episode) == query
-                            || format!("s{:02}e{:02}", ep_data.season, ep_data.episode) == query;
-                        row_widget.set_visible(name_match || ep_num_match);
+            // Birleşik filtre: arama + sezon + izlenme (Lowell apply_filter uyarlaması).
+            let f_state = Rc::new(RefCell::new((
+                String::new(),
+                if seasons.len() > 1 { seasons[0] } else { 0 },
+                0i8,
+            )));
+            let apply_ep_filter = {
+                let rows = rows_rc.clone();
+                let f_state = f_state.clone();
+                Rc::new(move || {
+                    let (q, season, w) = f_state.borrow().clone();
+                    for (ep_data, row_widget, watched) in rows.iter() {
+                        let mut show = true;
+                        if !q.is_empty() {
+                            let name_match = ep_data.name.to_lowercase().contains(&q);
+                            let ep_num_match = ep_data.episode.to_string() == q
+                                || format!("e{}", ep_data.episode) == q
+                                || format!("s{:02}e{:02}", ep_data.season, ep_data.episode) == q;
+                            show &= name_match || ep_num_match;
+                        }
+                        if season != 0 {
+                            show &= ep_data.season == season;
+                        }
+                        match w {
+                            1 => show &= *watched.borrow(),
+                            2 => show &= !*watched.borrow(),
+                            _ => {}
+                        }
+                        set_ep_row_visible(row_widget, show);
                     }
+                })
+            };
+            // Sezon hapları (çok sezonluysa).
+            if seasons.len() > 1 {
+                let lbl = gtk::Label::new(Some("Sezon:"));
+                lbl.add_css_class("dim-label");
+                lbl.set_valign(gtk::Align::Center);
+                filter_bar.append(&lbl);
+                let pills: Rc<RefCell<Vec<(u64, gtk::Button)>>> =
+                    Rc::new(RefCell::new(Vec::new()));
+                for s in &seasons {
+                    let b = gtk::Button::with_label(&format!("S{s}"));
+                    b.add_css_class("pill");
+                    if *s == seasons[0] {
+                        b.add_css_class("suggested-action");
+                    }
+                    b.set_valign(gtk::Align::Center);
+                    {
+                        let pills = pills.clone();
+                        let f_state = f_state.clone();
+                        let apply = apply_ep_filter.clone();
+                        let ss = *s;
+                        b.connect_clicked(move |btn| {
+                            // Aktif hapa tekrar dokun → seçim kalkar (tümü).
+                            if f_state.borrow().1 == ss {
+                                btn.remove_css_class("suggested-action");
+                                f_state.borrow_mut().1 = 0;
+                            } else {
+                                for (_, p) in pills.borrow().iter() {
+                                    p.remove_css_class("suggested-action");
+                                }
+                                btn.add_css_class("suggested-action");
+                                f_state.borrow_mut().1 = ss;
+                            }
+                            apply();
+                        });
+                    }
+                    pills.borrow_mut().push((*s, b.clone()));
+                    filter_bar.append(&b);
                 }
-            });
+            }
+            // İzlenme filtresi: Tümü / İzlendi / İzlenmemiş.
+            {
+                let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                spacer.set_hexpand(true);
+                filter_bar.append(&spacer);
+                let btns: Rc<RefCell<Vec<gtk::ToggleButton>>> =
+                    Rc::new(RefCell::new(Vec::new()));
+                let busy = Rc::new(Cell::new(false));
+                for (i, n) in ["Tümü", "İzlendi", "İzlenmemiş"].iter().enumerate() {
+                    let tb = gtk::ToggleButton::with_label(n);
+                    tb.add_css_class("pill");
+                    if i == 0 {
+                        tb.set_active(true);
+                    }
+                    {
+                        let btns = btns.clone();
+                        let busy = busy.clone();
+                        let f_state = f_state.clone();
+                        let apply = apply_ep_filter.clone();
+                        tb.connect_toggled(move |b| {
+                            if busy.get() {
+                                return;
+                            }
+                            busy.set(true);
+                            if b.is_active() {
+                                for (j, x) in btns.borrow().iter().enumerate() {
+                                    if j != i {
+                                        x.set_active(false);
+                                    }
+                                }
+                                f_state.borrow_mut().2 = i as i8;
+                            } else if !btns.borrow().iter().any(|x| x.is_active()) {
+                                b.set_active(true);
+                            }
+                            busy.set(false);
+                            apply();
+                        });
+                    }
+                    btns.borrow_mut().push(tb.clone());
+                    filter_bar.append(&tb);
+                }
+            }
+            apply_ep_filter();
+            {
+                let f_state = f_state.clone();
+                let apply = apply_ep_filter.clone();
+                ep_search_entry.connect_search_changed(move |e| {
+                    f_state.borrow_mut().0 = e.text().trim().to_lowercase();
+                    apply();
+                });
+            }
 
             root.append(&list_box);
+
+            // Detay sekmeleri: Bölümler (canlı) + Ekip/Benzerler/İncelemeler
+            // (auth-gated; hesap desteği gelene kadar giriş-isteyen yer tutucu).
+            // (Lowell sekme çubuğu uyarlaması.)
+            let tab_names = ["Bölümler", "Ekip", "Benzerler", "İncelemeler"];
+            let tabbar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            tabbar.add_css_class("linked");
+            tabbar.set_halign(gtk::Align::Fill);
+            tabbar.set_hexpand(true);
+            tabbar.set_margin_bottom(8);
+            tabbar.set_margin_start(12);
+            tabbar.set_margin_end(12);
+            let placeholders: Vec<gtk::Widget> = [
+                (
+                    "Ekip",
+                    "Oyuncu ve ekip künyesi için giriş gerekli.\nHesap desteği yakında.",
+                    "system-users-symbolic",
+                ),
+                (
+                    "Benzerler",
+                    "Benzer başlıklar için giriş gerekli.\nHesap desteği yakında.",
+                    "applications-graphics-symbolic",
+                ),
+                (
+                    "İncelemeler",
+                    "İncelemeler için giriş gerekli.\nHesap desteği yakında.",
+                    "document-edit-symbolic",
+                ),
+            ]
+            .iter()
+            .map(|(t, b, icon)| {
+                let sp = components::create_status_page(t, b, icon);
+                sp.set_visible(false);
+                sp.set_halign(gtk::Align::Fill);
+                sp.set_hexpand(true);
+                sp.set_valign(gtk::Align::Center);
+                root.append(&sp);
+                sp.upcast::<gtk::Widget>()
+            })
+            .collect();
+            let tab_btns: Rc<RefCell<Vec<gtk::ToggleButton>>> =
+                Rc::new(RefCell::new(Vec::new()));
+            let tab_busy = Rc::new(Cell::new(false));
+            for (i, n) in tab_names.iter().enumerate() {
+                let tb = gtk::ToggleButton::with_label(n);
+                // Dar pencerede küçül + kısalt (kaydırma yok).
+                tb.set_hexpand(true);
+                if let Some(l) = tb.child().and_downcast::<gtk::Label>() {
+                    l.set_hexpand(true);
+                    l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                }
+                if i == 0 {
+                    tb.set_active(true);
+                }
+                {
+                    let tab_btns = tab_btns.clone();
+                    let tab_busy = tab_busy.clone();
+                    let list_box_c = list_box.clone();
+                    let placeholders_c = placeholders.clone();
+                    tb.connect_toggled(move |b| {
+                        if tab_busy.get() {
+                            return;
+                        }
+                        tab_busy.set(true);
+                        if b.is_active() {
+                            for (j, x) in tab_btns.borrow().iter().enumerate() {
+                                if j != i {
+                                    x.set_active(false);
+                                }
+                            }
+                            list_box_c.set_visible(i == 0);
+                            for (j, ph) in placeholders_c.iter().enumerate() {
+                                ph.set_visible(i == j + 1);
+                            }
+                        } else if !tab_btns.borrow().iter().any(|x| x.is_active()) {
+                            b.set_active(true);
+                        }
+                        tab_busy.set(false);
+                    });
+                }
+                tab_btns.borrow_mut().push(tb.clone());
+                tabbar.append(&tb);
+            }
+            root.insert_child_after(&tabbar, Some(&filter_bar));
         }
 
         scroll.set_child(Some(&root));
@@ -2100,6 +3553,7 @@ impl App {
             Msg::Cats(res) => match res {
                 Ok(cats) => {
                     *self.cats.borrow_mut() = cats;
+                    self.home_dirty.set(true);
                     if self.page_history.borrow().last() == Some(&Page::Home) {
                         self.show_page(&Page::Home);
                     }
@@ -2107,30 +3561,39 @@ impl App {
                 Err(e) => self.show_error(&e),
             },
             Msg::Search(res) => match res {
-                Ok(results) => {
-                    *self.search_results.borrow_mut() = results;
-                    let mut st = self.page_history.borrow_mut();
-                    if st.last() != Some(&Page::Search) {
-                        st.push(Page::Search);
+                Ok(results) => self.show_search_results(results),
+                Err(e) => self.show_error(&e),
+            },
+            Msg::News(page, res) => match res {
+                Ok((items, total, last)) => {
+                    *self.news.borrow_mut() = Some((items, total, last));
+                    self.news_page.set(page);
+                    if self.page_history.borrow().last() == Some(&Page::News) {
+                        self.show_page(&Page::News);
                     }
-                    drop(st);
-                    self.show_page(&Page::Search);
+                }
+                Err(e) => self.show_error(&e),
+            },
+            Msg::Calendar(res) => match res {
+                Ok(days) => {
+                    *self.calendar.borrow_mut() = Some(days);
+                    if self.page_history.borrow().last() == Some(&Page::Calendar) {
+                        self.show_page(&Page::Calendar);
+                    }
+                }
+                Err(e) => self.show_error(&e),
+            },
+            Msg::Discover(res) => match res {
+                Ok((items, total, last)) => {
+                    *self.discover.borrow_mut() = Some((items, total, last));
+                    if self.page_history.borrow().last() == Some(&Page::Kesfet) {
+                        self.show_page(&Page::Kesfet);
+                    }
                 }
                 Err(e) => self.show_error(&e),
             },
             Msg::Eps(title, res) => match res {
-                Ok(eps) => {
-                    let page = if eps.is_empty() {
-                        Page::Movie { title, eps }
-                    } else {
-                        match title.title_type.as_deref() {
-                            Some("movie") => Page::Movie { title, eps },
-                            _ => Page::Episodes { title, eps },
-                        }
-                    };
-                    self.page_history.borrow_mut().push(page.clone());
-                    self.show_page(&page);
-                }
+                Ok(eps) => self.show_title_eps(title, eps),
                 Err(e) => self.show_error(&e),
             },
             Msg::Play(title, ep, res) => match res {
@@ -2311,6 +3774,8 @@ impl App {
         let title = title.clone();
         let ep = ep.clone();
         eprintln!("[PLAY] çağrıldı: {} S{:02}E{:02}", title.name, ep.season, ep.episode);
+        // İzleme geçmişi/değişir → eve dönüşte devam rafı tazelensin.
+        self.home_dirty.set(true);
         let is_movie = title.title_type.as_deref() == Some("movie");
         if is_movie {
             self.play_resolved(&title, &ep, None);
@@ -3106,6 +4571,261 @@ impl App {
         }
     }
 
+    /// Debounce'lu arama dialogu: yazarken 350ms bekler, ilk 15 sonucu
+    /// kart dizer, Enter ilk sonuca gider (Lowell137/animecix-linux uyarlaması;
+    /// AdwDialog yerine adw sürümümüze uygun modal adw::Window).
+    pub fn open_search_popup(&self) {
+        self.open_search_popup_with("");
+    }
+
+    /// Headbar hapından devredilen metinle açılır (boşsa boş açılır;
+    /// doluysa arama hemen başlar).
+    pub fn open_search_popup_with(&self, initial: &str) {
+        let dlg = adw::Window::new();
+        dlg.set_title(Some("Ara"));
+        dlg.set_modal(true);
+        dlg.set_transient_for(Some(&self.window));
+        dlg.set_default_size(520, 560);
+
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let titlebar = adw::HeaderBar::new();
+        let title = adw::WindowTitle::new("Ara", "");
+        titlebar.set_title_widget(Some(&title));
+        // Kapatma: HeaderBar'ın native pencere kontrolleri yeterli
+        // (çift X olmaması için özel buton yok).
+        root.append(&titlebar);
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        header.set_margin_top(0);
+        header.set_margin_bottom(12);
+        header.set_margin_start(12);
+        header.set_margin_end(12);
+        let entry = gtk::SearchEntry::new();
+        entry.set_placeholder_text(Some("Anime veya dizi ara…"));
+        entry.set_hexpand(true);
+        header.append(&entry);
+        root.append(&header);
+
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_hexpand(true);
+        scroll.set_vexpand(true);
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        let results = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        results.set_margin_top(10);
+        results.set_margin_bottom(12);
+        results.set_margin_start(12);
+        results.set_margin_end(12);
+        scroll.set_child(Some(&results));
+        root.append(&scroll);
+        dlg.set_content(Some(&root));
+
+        fn clear(box_: &gtk::Box) {
+            let mut cur = box_.first_child();
+            while let Some(child) = cur {
+                let next = child.next_sibling();
+                box_.remove(&child);
+                cur = next;
+            }
+        }
+
+        fn show_empty(box_: &gtk::Box) {
+            clear(box_);
+            let col = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            col.set_halign(gtk::Align::Center);
+            col.set_valign(gtk::Align::Center);
+            col.set_vexpand(true);
+            col.set_margin_top(64);
+            let img = gtk::Image::from_icon_name("system-search-symbolic");
+            img.set_pixel_size(48);
+            img.set_opacity(0.35);
+            let lbl = gtk::Label::new(Some("Aramak istediğiniz anime veya diziyi yazın"));
+            lbl.add_css_class("dim-label");
+            lbl.set_opacity(0.65);
+            col.append(&img);
+            col.append(&lbl);
+            box_.append(&col);
+        }
+
+        fn spinner(box_: &gtk::Box) {
+            clear(box_);
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            row.set_halign(gtk::Align::Center);
+            row.set_margin_top(48);
+            let sp = gtk::Spinner::new();
+            sp.start();
+            let lbl = gtk::Label::new(Some("Aranıyor…"));
+            lbl.add_css_class("dim-label");
+            row.append(&sp);
+            row.append(&lbl);
+            box_.append(&row);
+        }
+
+        show_empty(&results);
+
+        let dlg_w = dlg.downgrade();
+        let gen = Rc::new(Cell::new(0u32));
+        let first_hit: Rc<RefCell<Option<Title>>> = Rc::new(RefCell::new(None));
+        {
+            let results_w = results.downgrade();
+            let dlg_w_rows = dlg_w.clone();
+            let gen = gen.clone();
+            let first_hit = first_hit.clone();
+            let client = self.client.clone();
+            let this = self.clone_ref();
+            entry.connect_search_changed(move |e| {
+                let q = e.text().to_string();
+                let my = gen.get() + 1;
+                gen.set(my);
+                if q.trim().is_empty() {
+                    if let Some(b) = results_w.upgrade() {
+                        show_empty(&b);
+                    }
+                    *first_hit.borrow_mut() = None;
+                    return;
+                }
+                if let Some(b) = results_w.upgrade() {
+                    spinner(&b);
+                }
+                let results_w2 = results_w.clone();
+                let dlg_w2 = dlg_w_rows.clone();
+                let gen2 = gen.clone();
+                let first_hit2 = first_hit.clone();
+                let client2 = client.clone();
+                let this2 = this.clone();
+                glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(350),
+                    move || {
+                        if gen2.get() != my {
+                            return;
+                        }
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(client2.search(&q));
+                        });
+                        glib::idle_add_local(move || match rx.try_recv() {
+                            Ok(res) => {
+                                if gen2.get() != my {
+                                    return glib::ControlFlow::Break;
+                                }
+                                let Some(box_) = results_w2.upgrade() else {
+                                    return glib::ControlFlow::Break;
+                                };
+                                clear(&box_);
+                                match res {
+                                    Ok(list) => {
+                                        let mut first: Option<Title> = None;
+                                        for t in list.iter().take(15) {
+                                            if first.is_none() {
+                                                first = Some(t.clone());
+                                            }
+                                            let row = gtk::Box::new(
+                                                gtk::Orientation::Horizontal,
+                                                12,
+                                            );
+                                            row.add_css_class("history-item-card");
+                                            row.set_margin_top(3);
+                                            row.set_margin_bottom(3);
+                                            row.set_margin_start(4);
+                                            row.set_margin_end(4);
+                                            let pic = this2.covers.cover_picture(
+                                                t.poster.as_deref(),
+                                                48,
+                                                72,
+                                            );
+                                            pic.set_valign(gtk::Align::Center);
+                                            row.append(&pic);
+                                            let vb = gtk::Box::new(
+                                                gtk::Orientation::Vertical,
+                                                4,
+                                            );
+                                            vb.set_valign(gtk::Align::Center);
+                                            vb.set_hexpand(true);
+                                            let name = gtk::Label::new(Some(&t.name));
+                                            name.add_css_class("title-4");
+                                            name.set_xalign(0.0);
+                                            name.set_single_line_mode(true);
+                                            name.set_ellipsize(
+                                                gtk::pango::EllipsizeMode::End,
+                                            );
+                                            vb.append(&name);
+                                            let meta = gtk::Label::new(Some(
+                                                &t.meta_line(),
+                                            ));
+                                            meta.add_css_class("dim-label");
+                                            meta.set_xalign(0.0);
+                                            vb.append(&meta);
+                                            row.append(&vb);
+                                            let tc = t.clone();
+                                            let this3 = this2.clone_ref();
+                                            let dlg_w3 = dlg_w2.clone();
+                                            let gesture = gtk::GestureClick::new();
+                                            gesture.connect_pressed(move |_, _, _, _| {
+                                                if let Some(d) = dlg_w3.upgrade() {
+                                                    d.close();
+                                                }
+                                                this3.open_episodes(tc.clone());
+                                            });
+                                            row.add_controller(gesture);
+                                            box_.append(&row);
+                                        }
+                                        *first_hit2.borrow_mut() = first;
+                                        if box_.first_child().is_none() {
+                                            let col = gtk::Box::new(gtk::Orientation::Vertical, 8);
+                                            col.set_halign(gtk::Align::Center);
+                                            col.set_margin_top(48);
+                                            let img = gtk::Image::from_icon_name("system-search-symbolic");
+                                            img.set_pixel_size(48);
+                                            img.set_opacity(0.35);
+                                            let title = gtk::Label::new(Some("Sonuç bulunamadı"));
+                                            title.add_css_class("title-4");
+                                            let sub = gtk::Label::new(Some("Farklı bir arama terimi deneyin"));
+                                            sub.add_css_class("dim-label");
+                                            col.append(&img);
+                                            col.append(&title);
+                                            col.append(&sub);
+                                            box_.append(&col);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let lbl = gtk::Label::new(Some(&format!(
+                                            "Arama başarısız: {err}"
+                                        )));
+                                        lbl.add_css_class("dim-label");
+                                        lbl.set_wrap(true);
+                                        lbl.set_halign(gtk::Align::Center);
+                                        lbl.set_margin_top(36);
+                                        box_.append(&lbl);
+                                    }
+                                }
+                                glib::ControlFlow::Break
+                            }
+                            Err(_) => glib::ControlFlow::Continue,
+                        });
+                    },
+                );
+            });
+        }
+        // Enter: ilk sonuca git.
+        {
+            let dlg_w_act = dlg_w.clone();
+            let first_hit = first_hit.clone();
+            let this = self.clone_ref();
+            entry.connect_activate(move |_| {
+                if let Some(t) = first_hit.borrow().clone() {
+                    if let Some(d) = dlg_w_act.upgrade() {
+                        d.close();
+                    }
+                    this.open_episodes(t);
+                }
+            });
+        }
+        dlg.present();
+        if !initial.trim().is_empty() {
+            entry.set_text(initial);
+        }
+        entry.grab_focus();
+    }
+
     fn do_search(&self, q: String) {
         let q = q.trim().to_string();
         if q.is_empty() { return; }
@@ -3116,12 +4836,142 @@ impl App {
         });
     }
 
+    /// Arama sonuçlarını Search sayfasında gösterir (do_search + palet ortak).
+    fn show_search_results(&self, results: Vec<Title>) {
+        *self.search_results.borrow_mut() = results;
+        let mut st = self.page_history.borrow_mut();
+        if st.last() != Some(&Page::Search) {
+            st.push(Page::Search);
+        }
+        drop(st);
+        self.show_page(&Page::Search);
+    }
+
+    /// Başlık + bölümleri Episodes/Movie sayfasında gösterir (Eps + palet ortak).
+    fn show_title_eps(&self, title: Title, eps: Vec<Episode>) {
+        let page = if eps.is_empty() {
+            Page::Movie { title, eps }
+        } else {
+            match title.title_type.as_deref() {
+                Some("movie") => Page::Movie { title, eps },
+                _ => Page::Episodes { title, eps },
+            }
+        };
+        self.page_history.borrow_mut().push(page.clone());
+        self.show_page(&page);
+    }
+
+    /// Sürüm notları: bilinen sürüm → kaydırılabilir yenilik penceresi.
+    /// Her sürümde bir kez. CHANGELOG.md'deki Öne çıkanlar + Eklenenler
+    /// başlıksız tek liste olarak konur (okunması kolay, kaydırmalı).
+    pub(crate) fn maybe_show_changelog(&self) {
+        let cur = crate::update::CURRENT_VERSION;
+        if self.settings.borrow().seen_changelog == cur {
+            return;
+        }
+        {
+            let mut s = self.settings.borrow_mut();
+            s.seen_changelog = cur.to_string();
+            self.client.save_settings(&s);
+        }
+        let Some((heading, items)) = changelog_items(cur) else { return };
+        let dlg = adw::Window::new();
+        dlg.set_title(Some(heading));
+        dlg.set_modal(true);
+        dlg.set_transient_for(Some(&self.window));
+        dlg.set_default_size(520, 560);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let titlebar = adw::HeaderBar::new();
+        let title = adw::WindowTitle::new(heading, "");
+        titlebar.set_title_widget(Some(&title));
+        root.append(&titlebar);
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_hexpand(true);
+        scroll.set_vexpand(true);
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        list.set_margin_top(16);
+        list.set_margin_bottom(18);
+        list.set_margin_start(18);
+        list.set_margin_end(18);
+        for it in items {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            let dot = gtk::Label::new(Some("•"));
+            dot.set_valign(gtk::Align::Start);
+            dot.add_css_class("dim-label");
+            row.append(&dot);
+            let lbl = gtk::Label::new(Some(it));
+            lbl.set_xalign(0.0);
+            lbl.set_wrap(true);
+            lbl.set_hexpand(true);
+            row.append(&lbl);
+            list.append(&row);
+        }
+        scroll.set_child(Some(&list));
+        root.append(&scroll);
+        dlg.set_content(Some(&root));
+        dlg.present();
+    }
+
     fn fetch_home(&self) {
         self.busy(true);
         self.spawn(move |c| {
             let res = c.home_lists();
             move || Msg::Cats(res)
         });
+    }
+
+    /// Haber sayfası + önbellek doldurma (Lowell uyarlaması).
+    fn fetch_news(&self, page: u32) {
+        self.news_page.set(page.max(1));
+        self.busy(true);
+        let page = self.news_page.get();
+        self.spawn(move |c| {
+            let res = c.news(page);
+            move || Msg::News(page, res)
+        });
+    }
+
+    /// Takvim doldurma (Lowell uyarlaması).
+    fn fetch_calendar(&self) {
+        self.busy(true);
+        self.spawn(move |c| {
+            let res = c.calendar();
+            move || Msg::Calendar(res)
+        });
+    }
+
+    /// Keşfet: filtredeki sayfayla çalışır (Lowell uyarlaması).
+    fn fetch_discover(&self) {
+        let f = self.discover_filter.borrow().clone();
+        self.busy(true);
+        self.spawn(move |c| {
+            let res = c.discover(&f);
+            move || Msg::Discover(res)
+        });
+    }
+
+    /// Sayfaya git + gerekiyorsa verisini çek (sidebar/kısayol ortak).
+    pub fn open_data_page(&self, p: &Page) {
+        match p {
+            Page::News => {
+                if self.news.borrow().is_none() {
+                    self.fetch_news(self.news_page.get());
+                }
+            }
+            Page::Calendar => {
+                if self.calendar.borrow().is_none() {
+                    self.fetch_calendar();
+                }
+            }
+            Page::Kesfet => {
+                if self.discover.borrow().is_none() {
+                    self.fetch_discover();
+                }
+            }
+            _ => {}
+        }
+        self.navigate_to(p);
     }
 
     fn show_error(&self, msg: &str) {
@@ -3132,9 +4982,35 @@ impl App {
     }
 }
 
+/// Sürüm yenilik maddeleri (bilinmeyen sürüm → None, sessiz geçilir).
+/// Kaynak: CHANGELOG.md (Öne çıkanlar + Eklenenler, başlıksız tek liste).
+fn changelog_items(v: &str) -> Option<(&'static str, Vec<&'static str>)> {
+    match v {
+        "1.2.6" => Some((
+            "Yenilikler (v1.2.6)",
+            vec![
+                "Ana sayfa donması düzeltildi: kapaklar arka planda yükleniyor, sayfa açılırken takılma olmuyor.",
+                "Hero eklendi: bölümü/filmi doğrulanmış animeler öneriliyor, tam genişlik.",
+                "Haberler, Yayın Takvimi ve Keşfet eklendi: güncel haberleri ve yayın takvimini takip edebilir, Keşfet ile yeni animeler bulabilirsin.",
+                "Arayüz ölçeği serbest oldu: %100–%125 arası istediğin değer.",
+                "Arayüz Lowell'in katkılarıyla yenilendi: yan ray + daraltma, arama dialogu, headbar arama hapı, devam rafı, sayfalı raflar.",
+                "Puan hapı, sezon ve izlendi filtreleri, detay sekmeleri eklendi.",
+                "F1 kısayollar penceresi ve F11 tam ekran eklendi.",
+                "Kuantum responsive kartlar: pencere büyüyünce kartlar da büyür; poster üzerine gelince hafifçe kalkar.",
+                "Sürüm-notları popup'ı eklendi.",
+                "Gömülü Adwaita ikonları eklendi (59 SVG).",
+                "Kapak kalite değişiminde önbellek-temizleme uyarısı eklendi.",
+            ],
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod decide_retry_tests {
     use super::App;
+    use super::Page;
+    use crate::api::Title;
 
     #[test]
     fn decide_retry_source_error_retries() {
@@ -3203,10 +5079,129 @@ mod decide_retry_tests {
     }
 
     #[test]
+    fn hero_pool_orders_and_dedups() {
+        let t = |id: u64, rating: Option<f64>, year: Option<i64>, genres: &[&str]| Title {
+            id,
+            name: format!("t{id}"),
+            rating,
+            year,
+            poster: Some("p".to_string()),
+            genres: Some(genres.iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
+        };
+        let cats = vec![
+            crate::api::Category {
+                name: "a".to_string(),
+                items: vec![
+                    t(1, Some(8.5), Some(2023), &["action"]),
+                    t(2, None, Some(1999), &["action"]),
+                    t(3, None, None, &["action"]),
+                ],
+            },
+            crate::api::Category {
+                name: "b".to_string(),
+                items: vec![
+                    t(1, Some(8.5), Some(2023), &["action"]), // tekrar
+                    Title {
+                        id: 4,
+                        name: "t4".to_string(),
+                        ..Default::default()
+                    }, // görsel yok
+                ],
+            },
+        ];
+        // t(4)'ün posteri yok → elenir; t(1) bir kez.
+        let pool = super::hero_pool(&cats);
+        let ids: Vec<u64> = pool.iter().map(|x| x.id).collect();
+        assert_eq!(ids, vec![1, 2, 3], "puan+yıl öne, tekrar/görsel-elendi");
+    }
+
+    #[test]
+    fn hero_pool_skips_certain_empty_anime_but_not_movies() {
+        let t = |id: u64, eps: Option<i64>, tt: Option<&str>| Title {
+            id,
+            name: format!("t{id}"),
+            poster: Some("p".to_string()),
+            episode_count: eps,
+            title_type: tt.map(|s| s.to_string()),
+            ..Default::default()
+        };
+        let cats = vec![crate::api::Category {
+            name: "a".to_string(),
+            items: vec![
+                t(1, Some(0), None),              // kesin boş anime → elenir
+                t(2, Some(0), Some("movie")),     // film muaf → kalır
+                t(3, Some(12), None),             // bölümlü → kalır
+                t(4, None, None),                 // bilinmeyen → kalır (arkada)
+            ],
+        }];
+        let pool = super::hero_pool(&cats);
+        let ids: Vec<u64> = pool.iter().map(|x| x.id).collect();
+        assert!(!ids.contains(&1), "bölümsüz anime elendi");
+        assert!(ids.contains(&2), "film muaf");
+        assert!(ids.contains(&3) && ids.contains(&4), "diğerleri durur");
+        assert_eq!(*ids.last().unwrap(), 4, "bilinmeyen en arkada");
+    }
+
+    #[test]
+    fn pick_spotlight_table() {        let pool: Vec<Title> = (0..10)
+            .map(|i| Title {
+                id: i,
+                name: format!("t{i}"),
+                ..Default::default()
+            })
+            .collect();
+        // Aynı tohum → aynı sıra.
+        let a = super::pick_spotlight(&pool, 8, 42);
+        let b = super::pick_spotlight(&pool, 8, 42);
+        assert_eq!(
+            a.iter().map(|t| t.id).collect::<Vec<_>>(),
+            b.iter().map(|t| t.id).collect::<Vec<_>>()
+        );
+        // Slot sayısı respected.
+        assert_eq!(super::pick_spotlight(&pool, 8, 42).len(), 8);
+        assert_eq!(super::pick_spotlight(&pool, 99, 42).len(), 10);
+        assert!(super::pick_spotlight(&[], 8, 42).is_empty());
+        // Farklı tohum → farklı sıra (10 öğede pratikte kesin).
+        let c = super::pick_spotlight(&pool, 8, 1337);
+        assert_ne!(
+            a.iter().map(|t| t.id).collect::<Vec<_>>(),
+            c.iter().map(|t| t.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn card_quantum_table() {
+        // 1280px: 7 sütun, 160px kart.
+        assert_eq!(super::card_quantum(1280), (7, 160));
+        // Dar: 3 sütun tabanı, 140px tabanı.
+        assert_eq!(super::card_quantum(500), (3, 140));
+        // Geniş: 8 sütun tavanı, 220px tavanı.
+        let (c, w) = super::card_quantum(3000);
+        assert_eq!(c, 8);
+        assert_eq!(w, 220);
+    }
+
+    #[test]
+    fn hero_h_table() {
+        // Lowell hero_h_for_window vektörleri birebir.
+        assert_eq!(super::hero_h_for_window(885, 8), 460);
+        assert_eq!(super::hero_h_for_window(800, 5), 400);
+        assert_eq!(super::hero_h_for_window(680, 3), 360);
+        assert_eq!(super::hero_h_for_window(2000, 8), 560);
+    }
+
+    #[test]
     fn socket_timeout_only_when_socket_never_seen() {
         assert!(App::socket_timeout_hit(26, false), "soket hiç gelmedi + 25sn doldu -> vazgeç");
         assert!(!App::socket_timeout_hit(24, false), "henüz süre dolmadı");
         assert!(!App::socket_timeout_hit(600, true), "soket varken zaman aşımı uygulanmaz");
+    }
+
+    #[test]
+    fn changelog_known_and_unknown() {
+        assert!(super::changelog_items("1.2.6").is_some());
+        assert!(super::changelog_items("9.9.9").is_none());
     }
 
     #[test]

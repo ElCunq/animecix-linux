@@ -64,8 +64,24 @@ pub struct CoverManager {
     order: Rc<RefCell<VecDeque<String>>>,
 }
 
-/// Çözümlü kapak üst sınırı (~80 adet; raf boyunda ~10MB).
-const MAX_L1_COVERS: usize = 80;
+/// Çözümlü kapak üst sınırı (~30MB; raf boyunda yeterli, çalkalanma yok).
+const MAX_L1_COVERS: usize = 250;
+
+/// Aynı anda çalışan kapak işçisi (donma testi 1'di; 3 paralel + UI-dışı
+/// decode ile hem hızlı hem donmasız).
+const MAX_COVER_WORKERS: usize = 3;
+
+/// UI-dışı işçide üretilen ham doku: boyutlar + RGBA/RGB pikseller.
+/// `Pixbuf`/`Texture` `Send` olmadığından ham bayt taşınır; UI'da
+/// `from_bytes` ile sarılır (yalnızca memcpy + doku sargısı).
+struct RawCover {
+    key: String,
+    w: i32,
+    h: i32,
+    stride: i32,
+    has_alpha: bool,
+    pixels: Vec<u8>,
+}
 
 impl CoverManager {
     pub fn new(client: Arc<Client>) -> Self {
@@ -88,6 +104,17 @@ impl CoverManager {
             active: self.active.clone(),
             order: self.order.clone(),
         }
+    }
+
+    /// Bellek önbelleğini sıfırlar (kalite değişimi / wipe öncesi).
+    /// Bekleyen kuyruk da düşer; havadaki indirme bitince zararsız
+    /// şekilde yeniden kuyruğa girer (anahtarlar kaliteye bağlı).
+    pub fn reset(&self) {
+        self.cache.borrow_mut().clear();
+        self.order.borrow_mut().clear();
+        self.waiters.borrow_mut().clear();
+        self.queue.lock().unwrap().clear();
+        self.active.set(0);
     }
 
     /// LRU dokunuşu: anahtarı sona al, taşanı at.
@@ -139,17 +166,46 @@ impl CoverManager {
         self.pump_covers();
     }
 
-    pub fn scale_texture(bytes: &[u8], w: i32, h: i32) -> Option<gtk::gdk::Texture> {
+    /// Baytları bir kez çözüp `Pixbuf` verir (aynı URL'nin her boyu
+    /// ayrı decode etmez; bkz. `finish_cover_work`).
+    fn decode_pixbuf(bytes: &[u8]) -> Option<gdk_pixbuf::Pixbuf> {
         let loader = gdk_pixbuf::PixbufLoader::new();
         loader.write(bytes).ok()?;
         loader.close().ok()?;
-        let src = loader.pixbuf()?;
-        let pb = src.scale_simple(w, h, gdk_pixbuf::InterpType::Bilinear)?;
-        Some(gtk::gdk::Texture::for_pixbuf(&pb))
+        loader.pixbuf()
+    }
+
+    /// Pixbuf'tan hedef boyda kırpılmış pixbuf üretir (oranı koruyup
+    /// doldur-kırp). Saf pixbuf işlemi: UI-dışı işçide de çalışır.
+    fn crop_to_size(src: &gdk_pixbuf::Pixbuf, w: i32, h: i32) -> Option<gdk_pixbuf::Pixbuf> {
+        let (sw, sh) = (src.width() as f64, src.height() as f64);
+        if sw <= 0.0 || sh <= 0.0 || w <= 0 || h <= 0 {
+            return None;
+        }
+        let scale = (w as f64 / sw).max(h as f64 / sh);
+        let (dw, dh) = (
+            (sw * scale).round() as i32,
+            (sh * scale).round() as i32,
+        );
+        let pb = src.scale_simple(dw, dh, gdk_pixbuf::InterpType::Bilinear)?;
+        let x = ((dw - w) / 2).max(0);
+        let y = ((dh - h) / 2).max(0);
+        Some(pb.new_subpixbuf(x, y, w.min(dw), h.min(dh)))
+    }
+
+    /// Pixbuf'tan hedef boyda doku üretir (oranı koruyup doldur-kırp).
+    fn texture_for_size(src: &gdk_pixbuf::Pixbuf, w: i32, h: i32) -> Option<gtk::gdk::Texture> {
+        let sub = Self::crop_to_size(src, w, h)?;
+        Some(gtk::gdk::Texture::for_pixbuf(&sub))
+    }
+
+    pub fn scale_texture(bytes: &[u8], w: i32, h: i32) -> Option<gtk::gdk::Texture> {
+        let src = Self::decode_pixbuf(bytes)?;
+        Self::texture_for_size(&src, w, h)
     }
 
     fn pump_covers(&self) {
-        let max_workers = 12;
+        let max_workers = MAX_COVER_WORKERS;
         let mut active = self.active.get();
 
         while active < max_workers {
@@ -161,15 +217,51 @@ impl CoverManager {
 
             let client = self.client.clone();
             let url2 = url.clone();
-            let (tx, rx) = std::sync::mpsc::channel::<(String, Option<Vec<u8>>)>();
+            // UI tarafında boyut anlık görüntüsü: devirde eklenen
+            // bekleyenler iş bitiminde yeniden kuyruğa girer.
+            let sizes: Vec<(String, i32, i32)> = self
+                .waiters
+                .borrow()
+                .keys()
+                .filter_map(|key| {
+                    let rest = key.strip_prefix(&url)?.strip_prefix('@')?;
+                    let (ws, hs) = rest.split_once('x')?;
+                    Some((key.clone(), ws.parse().ok()?, hs.parse().ok()?))
+                })
+                .collect();
+            let (tx, rx) = std::sync::mpsc::channel::<(String, Vec<(String, Option<RawCover>)>)>();
             std::thread::spawn(move || {
-                let _ = tx.send((url2, client.get_bytes(&url)));
+                // Ağ + JPEG decode + Bilinear scale TAMAMI işçide;
+                // UI'ya yalnız ham piksel taşınır (donma düzeltmesi).
+                let bytes = client.get_bytes(&url2);
+                let decoded = bytes.as_deref().and_then(Self::decode_pixbuf);
+                let out: Vec<(String, Option<RawCover>)> = match decoded {
+                    Some(src) => sizes
+                        .into_iter()
+                        .map(|(key, w, h)| {
+                            let raw = Self::crop_to_size(&src, w, h).map(|pb| RawCover {
+                                key: key.clone(),
+                                w: pb.width(),
+                                h: pb.height(),
+                                stride: pb.rowstride(),
+                                has_alpha: pb.has_alpha(),
+                                pixels: pb.read_pixel_bytes().to_vec(),
+                            });
+                            (key, raw)
+                        })
+                        .collect(),
+                    None => sizes
+                        .into_iter()
+                        .map(|(key, _, _)| (key, None))
+                        .collect(),
+                };
+                let _ = tx.send((url2, out));
             });
 
             let this = self.clone_ref();
             glib::idle_add_local(move || match rx.try_recv() {
-                Ok((u, bytes)) => {
-                    this.finish_cover(&u, bytes);
+                Ok((u, done)) => {
+                    this.finish_cover_work(&u, done);
                     let curr = this.active.get();
                     if curr > 0 {
                         this.active.set(curr - 1);
@@ -182,48 +274,85 @@ impl CoverManager {
         }
     }
 
-    fn finish_cover(&self, url: &str, bytes: Option<Vec<u8>>) {
+    /// İşçi çıktısını uygular: ham pikseli sar + bekleyen resimlere bas.
+    /// UI'daki iş yalnız memcpy + doku sargısıdır. Anlık görüntü dışında
+    /// kalıp sonradan eklenen bekleyenler yeniden kuyruğa girer.
+    fn finish_cover_work(&self, url: &str, done: Vec<(String, Option<RawCover>)>) {
         let mut waiters = self.waiters.borrow_mut();
-        let mut keys_to_remove = Vec::new();
-
-        if let Some(b) = &bytes {
-            let mut cache = self.cache.borrow_mut();
-            for (key, pics) in waiters.iter() {
-                let Some(rest) = key.strip_prefix(url) else { continue };
-                let Some(rest) = rest.strip_prefix('@') else { continue };
-                let Some((ws, hs)) = rest.split_once('x') else { continue };
-                let (Ok(w), Ok(h)) = (ws.parse::<i32>(), hs.parse::<i32>()) else { continue };
-                if let Some(t) = Self::scale_texture(b, w, h) {
-                    for p in pics {
+        let mut cache = self.cache.borrow_mut();
+        let mut touched: Vec<String> = Vec::new();
+        for (key, raw) in done {
+            let Some(pics) = waiters.remove(&key) else {
+                continue;
+            };
+            match raw {
+                Some(r) => {
+                    let bytes = glib::Bytes::from(r.pixels.as_slice());
+                    let pb = gdk_pixbuf::Pixbuf::from_bytes(
+                        &bytes,
+                        gdk_pixbuf::Colorspace::Rgb,
+                        r.has_alpha,
+                        8,
+                        r.w,
+                        r.h,
+                        r.stride,
+                    );
+                    let t = gtk::gdk::Texture::for_pixbuf(&pb);
+                    for p in &pics {
                         p.set_paintable(Some(&t));
                     }
                     cache.insert(key.clone(), Some(t));
-                } else {
+                }
+                None => {
                     cache.insert(key.clone(), None);
                 }
-                keys_to_remove.push(key.clone());
             }
-            drop(cache);
-            for k in &keys_to_remove {
-                self.lru_touch(k);
-            }
-        } else {
-            let mut cache = self.cache.borrow_mut();
-            for (key, _) in waiters.iter() {
-                if key.starts_with(url) {
-                    cache.insert(key.clone(), None);
-                    keys_to_remove.push(key.clone());
-                }
-            }
-            drop(cache);
-            for k in &keys_to_remove {
-                self.lru_touch(k);
+            touched.push(key);
+        }
+        drop(cache);
+        for k in &touched {
+            self.lru_touch(k);
+        }
+        // Devirde eklenen bekleyenler (anlık görüntü dışı) yeniden kuyruğa.
+        let mut requeue = false;
+        for key in waiters.keys() {
+            if key.strip_prefix(url).and_then(|r| r.strip_prefix('@')).is_some() {
+                requeue = true;
+                break;
             }
         }
+        drop(waiters);
+        if requeue {
+            self.queue.lock().unwrap().push_back(url.to_string());
+            self.pump_covers();
+        }
+    }
+}
 
-        for k in keys_to_remove {
-            waiters.remove(&k);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cover_workers_are_sequential() {
+        // Donma düzeltmesi 1 işçiydi; 3 paralel + UI-dışı yük ile denge.
+        assert_eq!(MAX_COVER_WORKERS, 3, "işçi sayısı değişirse kuyruk hesabı gözden geçir");
+    }
+
+    #[test]
+    fn reset_clears_mem_state() {
+        let m = CoverManager::new(std::sync::Arc::new(Client::new()));
+        m.cache.borrow_mut().insert("k".to_string(), None);
+        m.order.borrow_mut().push_back("k".to_string());
+        m.waiters.borrow_mut().insert("k".to_string(), Vec::new());
+        m.queue.lock().unwrap().push_back("u".to_string());
+        m.active.set(1);
+        m.reset();
+        assert!(m.cache.borrow().is_empty(), "cache boşalmalı");
+        assert!(m.order.borrow().is_empty(), "sıra boşalmalı");
+        assert!(m.waiters.borrow().is_empty(), "bekleyenler boşalmalı");
+        assert!(m.queue.lock().unwrap().is_empty(), "kuyruk boşalmalı");
+        assert_eq!(m.active.get(), 0, "sayaç sıfırlanmalı");
     }
 }
 

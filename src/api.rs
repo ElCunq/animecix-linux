@@ -33,7 +33,7 @@ fn mem_cache_insert(
         map.remove(&k);
     }
 }
-const CACHE_VERSION: &str = "2";
+const CACHE_VERSION: &str = "3";
 
 pub struct Client {
     http: crate::http::Http,
@@ -46,6 +46,25 @@ pub struct Client {
     skip_plans: std::sync::Mutex<HashMap<String, (u64, CachedSkip)>>,
     /// Kasa sırrı önbelleği (zaman, sır). TTL 1sa; el girdisi bypass eder.
     vault: std::sync::Mutex<(u64, String)>,
+    /// Bu açılışta kapak wipe'ı yapıldı mı (popup kararı).
+    pub covers_wiped_this_boot: bool,
+}
+
+/// Kapak wipe bayrak dosyası (cache kökünde). Eski proses yazar,
+/// yeni proses ilk indirmeden önce tüketir (yarış yok).
+const WIPE_FLAG_FILE: &str = "covers_wipe_pending";
+
+/// Bayrak varsa covers/ dizinini silip bayrağı kaldırır.
+/// Yol parametreli; unit test edilebilir.
+pub(crate) fn consume_wipe_flag(cache_dir: &std::path::Path) -> bool {
+    let flag = cache_dir.join(WIPE_FLAG_FILE);
+    if !flag.exists() {
+        return false;
+    }
+    let _ = std::fs::remove_dir_all(cache_dir.join("covers"));
+    let _ = std::fs::create_dir_all(cache_dir.join("covers"));
+    let _ = std::fs::remove_file(&flag);
+    true
 }
 
 /// Önbelleğe giren plan verisi (ömür bağımsız, serileşebilir şekil).
@@ -128,9 +147,13 @@ pub struct FansubMirror {
     #[serde(default)]
     pub runtime: Option<i64>,
     #[serde(default)]
+    pub backdrop: Option<String>,
+    #[serde(default)]
     pub episode_count: Option<i64>,
     #[serde(default)]
     pub release_date: Option<String>,
+    #[serde(default)]
+    pub rating: Option<f64>,
 }
 
 impl Title {
@@ -157,12 +180,17 @@ impl Title {
             year: r["year"].as_i64(),
             title_type: if tt.is_empty() { None } else { Some(tt) },
             poster: r["poster"].as_str().map(|s| s.to_string()),
+            backdrop: r["backdrop"].as_str().map(|s| s.to_string()),
             description: r["description"].as_str().map(|s| s.to_string()),
             season_count: r["season_count"].as_i64(),
             genres,
             runtime: r["runtime"].as_i64(),
             episode_count: r["episode_count"].as_i64(),
             release_date: r["release_date"].as_str().map(|s| s.to_string()),
+            rating: r["tmdb_vote_average"]
+                .as_f64()
+                .or_else(|| r["local_vote_average"].as_f64())
+                .filter(|v| *v > 0.0),
         })
     }
 
@@ -173,7 +201,7 @@ impl Title {
         }
     }
 
-    fn tr_genre(s: &str) -> String {
+    pub(crate) fn tr_genre(s: &str) -> String {
         let t = match s.trim().to_lowercase().as_str() {
             "drama" => "Dram",
             "animation" => "Animasyon",
@@ -219,6 +247,40 @@ impl Title {
             None
         } else {
             Some(parts.join("  •  "))
+        }
+    }
+
+    /// Teknik türleri eleyen ilk anlamlı etiket (kart/hero için).
+    /// Anime bağlamında ayırt edici olmayanlar elenir.
+    pub fn display_genre(&self) -> Option<String> {
+        const TECH: &[&str] = &[
+            "animasyon",
+            "belgesel",
+            "haber",
+            "gerçeklik",
+            "talk show",
+            "pembe dizi",
+        ];
+        let gens = self.genres.as_ref()?;
+        gens.iter().map(|g| Self::tr_genre(g)).find(|t| {
+            let f = t.trim().to_lowercase();
+            !f.is_empty() && !TECH.contains(&f.as_str())
+        })
+    }
+
+    /// Kart alt yazısı: anlamlı tür, yoksa yıl, o da yoksa tip.
+    /// Boş dönmez (hayalet " " en son).
+    pub fn card_subtitle(&self) -> String {
+        if let Some(g) = self.display_genre() {
+            return g;
+        }
+        if let Some(y) = self.year {
+            return y.to_string();
+        }
+        match self.title_type.as_deref() {
+            Some("movie") => "Film".to_string(),
+            Some("anime") => "Anime".to_string(),
+            _ => " ".to_string(),
         }
     }
 
@@ -273,6 +335,182 @@ impl Title {
 pub struct Category {
     pub name: String,
     pub items: Vec<Title>,
+}
+
+// ---- Keşfet / Haber / Takvim / Son bölümler (Lowell uyarlaması) ----
+
+/// Başlık incelemesi (reviews?titleId=). Giriş ister (UI'da auth sonrası).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Review {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub score: f64,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub avatar: Option<String>,
+}
+
+/// Son eklenen bölüm (last-episodes). Herkese açık.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LastEpisode {
+    #[serde(default)]
+    pub title_id: u64,
+    #[serde(default)]
+    pub title_name: String,
+    #[serde(default)]
+    pub title_poster: Option<String>,
+    #[serde(default)]
+    pub title_type: Option<String>,
+    #[serde(default)]
+    pub season: u64,
+    #[serde(default)]
+    pub episode: u64,
+    #[serde(default)]
+    pub release_date: String,
+}
+
+impl LastEpisode {
+    /// Bölüm listesini açmak için en az bilgiyle başlık kurar.
+    pub fn ref_title(&self) -> Title {
+        Title {
+            id: self.title_id,
+            name: if self.title_name.is_empty() {
+                format!("Anime #{}", self.title_id)
+            } else {
+                self.title_name.clone()
+            },
+            title_type: self.title_type.clone(),
+            poster: self.title_poster.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Site haberi (/secure/news): başlık + gövde + kapak (meta.image).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NewsItem {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub backdrop: Option<String>,
+}
+
+/// Yayın takvimi günü (/secure/calendar): gün + o günkü bölümler.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CalendarEpisode {
+    #[serde(default)]
+    pub title: Title,
+    #[serde(default)]
+    pub season: u64,
+    #[serde(default)]
+    pub episode: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub poster: Option<String>,
+    #[serde(default)]
+    pub release_date: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CalendarDay {
+    #[serde(default)]
+    pub date: String,
+    #[serde(default)]
+    pub episodes: Vec<CalendarEpisode>,
+}
+
+/// ISO-8601 ("2026-09-07T17:00:00.000Z") içinden tarih/saat parçaları.
+/// Saat dilimi dönüşümü yapmaz (site UTC verir; gösterimde +3 TSİ eklenir).
+pub fn split_iso(s: &str) -> Option<(i64, u32, u32, u32, u32)> {
+    let (d, t) = s.split_once('T')?;
+    let dp: Vec<&str> = d.split('-').collect();
+    if dp.len() != 3 {
+        return None;
+    }
+    let y = dp[0].parse::<i64>().ok()?;
+    let m = dp[1].parse::<u32>().ok()?;
+    let day = dp[2].parse::<u32>().ok()?;
+    let tp: Vec<&str> = t.split(':').collect();
+    if tp.len() < 2 {
+        return None;
+    }
+    let hh = tp[0].parse::<u32>().ok()?;
+    let mm = tp[1].parse::<u32>().ok()?;
+    // TSİ = UTC+3 (gün taşması umursanmaz; rozet gösterimi için yeterli).
+    let hh = (hh + 3) % 24;
+    Some((y, m, day, hh, mm))
+}
+
+/// Keşfet sıraları (etiket, site değeri).
+pub const DISCOVER_ORDERS: &[(&str, Option<&str>)] = &[
+    ("Popülerite", None),
+    ("Kullanıcı Puanı", Some("user_score:desc")),
+];
+
+/// Keşfet anahtar sözcükleri (Türkçe etiket → site slugu).
+pub const DISCOVER_KEYWORDS: &[(&str, &str)] = &[
+    ("Tarihi", "history"),
+    ("Büyü", "magic"),
+    ("Spor", "sport"),
+    ("İsekai", "isekai"),
+    ("Askeri", "military"),
+    ("Dedektif", "detective"),
+    ("Ölüm", "death"),
+    ("Gizli Organizasyon", "secret%20organization"),
+    ("Ecchi", "ecchi"),
+    ("Harem", "harem"),
+    ("Ters Harem", "reverse%20harem"),
+    ("Vampir", "vampire"),
+    ("Kan, Vahşet", "blood"),
+    ("Shounen", "shounen"),
+    ("Shounen Ai", "shounen%20ai"),
+    ("Seinen", "seinen"),
+    ("Canavar", "monster"),
+    ("Doğaüstü", "supernatural"),
+    ("Şeytan", "demon"),
+    ("İntikam", "revenge"),
+    ("Zaman Yolculuğu", "time%20travel"),
+    ("Okul", "school"),
+    ("Uzay", "space"),
+    ("Shoujo", "shoujo"),
+    ("Oyun", "game"),
+    ("Samuray", "samurai"),
+    ("Ninja", "ninja"),
+    ("Yaşamdan Kesitler", "slice%20of%20life"),
+    ("İş Hayatı", "working%20life"),
+    ("Dövüş Sanatları", "martial%20arts"),
+    ("Yuri", "yuri"),
+    ("Yaoi", "yaoi"),
+];
+
+/// Keşfet filtresi (site `/browse` ile birebir).
+#[derive(Clone, Debug, Default)]
+pub struct DiscoverFilter {
+    pub genres: Vec<String>,
+    pub keywords: Vec<String>,
+    pub title_type: Option<String>,
+    pub order: Option<String>,
+    pub only_streamable: bool,
+    pub page: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -341,8 +579,6 @@ pub struct Settings {
     pub quick_search_shortcut: String,
     #[serde(default = "default_search_shortcut")]
     pub search_shortcut: String,
-    #[serde(default = "default_tools_shortcut")]
-    pub tools_shortcut: String,
     #[serde(default = "default_true")]
     pub auto_fullscreen: bool,
     #[serde(default = "default_true")]
@@ -367,6 +603,9 @@ pub struct Settings {
     pub fansub_ask_each_time: bool,
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    /// Haber gövde yazı boyu: "small" / "normal" / "large".
+    #[serde(default = "default_news_font")]
+    pub news_font_size: String,
     /// Tarayıcıdan alınan cf_clearance bileti (boşsa takılmaz). Log'a yazılmaz.
     #[serde(default)]
     pub cf_clearance: String,
@@ -392,20 +631,29 @@ pub struct Settings {
     /// İndirme klasörü (boşsa Videolar/Animecix).
     #[serde(default)]
     pub download_dir: Option<String>,
+    /// Yenilik popup'ı en son hangi sürümde gösterildi (her sürümde bir kez).
+    #[serde(default)]
+    pub seen_changelog: String,
 }
 fn default_loading() -> String { "overlay".into() }
 fn default_quick_search() -> bool { true }
 fn default_shortcut() -> String { "/".into() }
 fn default_search_shortcut() -> String { "Ctrl+S".into() }
-fn default_tools_shortcut() -> String { "Ctrl+T".into() }
 fn default_true() -> bool { true }
 fn default_upscale() -> String { "hafif".into() }
 fn default_patience() -> u64 { 20 }
 fn default_max_parallel() -> u64 { 1 }
 fn default_ui_scale() -> f32 { 1.0 }
+fn default_news_font() -> String { "normal".into() }
 fn default_theme() -> String { "koyu".into() }
 fn default_cover_quality() -> String { "orta".into() }
 
+/// Haber yazı boyu seçenekleri (id, görünen ad). Sıra ComboRow ile eşleşir.
+pub const NEWS_FONT_OPTIONS: [(&str, &str); 3] = [
+    ("small", "Küçük"),
+    ("normal", "Normal"),
+    ("large", "Büyük"),
+];
 /// Kapak kalite seçenekleri (id, görünen ad). Sıra ComboRow indeksleriyle eşleşir.
 pub const COVER_QUALITIES: [(&str, &str); 3] = [
     ("yuksek", "Yüksek"),
@@ -778,7 +1026,6 @@ impl Default for Settings {
             quick_search_enabled: default_quick_search(),
             quick_search_shortcut: default_shortcut(),
             search_shortcut: default_search_shortcut(),
-            tools_shortcut: default_tools_shortcut(),
             auto_fullscreen: default_true(),
             auto_update: default_true(),
             notify_uptodate: default_true(),
@@ -790,6 +1037,7 @@ impl Default for Settings {
             default_fansub_template: None,
             fansub_ask_each_time: true,
             ui_scale: default_ui_scale(),
+            news_font_size: default_news_font(),
             cf_clearance: String::new(),
             official_skip_secret: String::new(),
             show_music_hint: true,
@@ -798,6 +1046,7 @@ impl Default for Settings {
             theme: default_theme(),
             cover_quality: default_cover_quality(),
             download_dir: None,
+            seen_changelog: String::new(),
         }
     }
 }
@@ -862,21 +1111,14 @@ pub fn check_internet() -> InternetStatus {
     };
 }
 
-/// Diskteki kapak baytları zstd çerçevesidir (magic: 28 B5 2F FD).
-/// Eski ham (sıkıştırmasız) dosyalar olduğu gibi okunur (geriye uyum).
-const ZSTD_IMG_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
-const ZSTD_IMG_LEVEL: i32 = 6;
-
+/// Diskteki kapak baytları ham tutulur (zstd kaldırıldı; eski zstd
+/// dosyalar covers wipe ile temizlenir, tek tek çözülmez).
 fn encode_stored_image(raw: &[u8]) -> Vec<u8> {
-    zstd::encode_all(raw, ZSTD_IMG_LEVEL).unwrap_or_else(|_| raw.to_vec())
+    raw.to_vec()
 }
 
 fn decode_stored_image(stored: &[u8]) -> Option<Vec<u8>> {
-    if stored.len() >= 4 && stored[0..4] == ZSTD_IMG_MAGIC {
-        zstd::decode_all(stored).ok()
-    } else {
-        Some(stored.to_vec())
-    }
+    Some(stored.to_vec())
 }
 
 impl Client {
@@ -893,9 +1135,18 @@ impl Client {
         std::fs::create_dir_all(cache_dir.join("covers")).ok();
 
         #[cfg(not(test))]
+        let mut wiped_this_boot = false;
+        #[cfg(not(test))]
         {
             let ver_path = cache_dir.join("api").join(".cache_version");
-            if std::fs::read_to_string(&ver_path).ok().as_deref() != Some(CACHE_VERSION) {
+            let old_ver = std::fs::read_to_string(&ver_path).ok();
+            // Sürüm yükselmesi: kapak wipe'ı yeni prosese bırak (bayrak),
+            // indirme başlamadan tüketilir (yarış yok).
+            if matches!(old_ver.as_deref(), Some(v) if v != CACHE_VERSION) {
+                let _ = std::fs::write(cache_dir.join(WIPE_FLAG_FILE), "");
+            }
+            wiped_this_boot = consume_wipe_flag(&cache_dir);
+            if old_ver.as_deref() != Some(CACHE_VERSION) {
                 let _ = std::fs::remove_dir_all(cache_dir.join("api"));
                 let _ = std::fs::create_dir_all(cache_dir.join("api"));
                 let _ = std::fs::write(&ver_path, CACHE_VERSION);
@@ -910,6 +1161,10 @@ impl Client {
             skip_plans: std::sync::Mutex::new(HashMap::new()),
             vault: std::sync::Mutex::new((0, String::new())),
             cover_quality_mem: std::sync::Mutex::new(default_cover_quality()),
+            #[cfg(not(test))]
+            covers_wiped_this_boot: wiped_this_boot,
+            #[cfg(test)]
+            covers_wiped_this_boot: false,
         };
         c.http.set_cf_clearance(&c.load_settings().cf_clearance);
         c.remember_cover_quality(&c.load_settings().cover_quality);
@@ -1162,6 +1417,250 @@ impl Client {
             }
         }
         Ok(out)
+    }
+
+    fn u64_field(v: &serde_json::Value, key: &str) -> u64 {
+        v.get(key)
+            .and_then(|x| x.as_u64().or_else(|| x.as_str()?.parse::<u64>().ok()))
+            .unwrap_or(0)
+    }
+
+    fn str_field(v: &serde_json::Value, key: &str) -> String {
+        v.get(key).and_then(|x| x.as_str()).unwrap_or("").trim().to_string()
+    }
+
+    /// Site haberleri (1-indexli sayfa) → (öğeler, toplam, son_sayfa).
+    /// Herkese açık. 1 saat önbellekli. (Lowell uyarlaması.)
+    pub fn news(&self, page: u32) -> Result<(Vec<NewsItem>, usize, u32), String> {
+        let page = page.max(1);
+        let key = format!("news:{page}");
+        let d = self.cache_get(&key, 3600, |http| {
+            http.get(format!("{BASE}/secure/news"))
+                .header("Accept", "application/json")
+                .query(&[("page", &page.to_string())])
+                .send()
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?
+                .json()
+                .map_err(|e| e.to_string())
+        })?;
+        let p = &d["pagination"];
+        let total = p["total"].as_u64().unwrap_or(0) as usize;
+        let last = p["last_page"].as_u64().unwrap_or(1).max(1) as u32;
+        let mut out = Vec::new();
+        if let Some(arr) = p["data"].as_array() {
+            for n in arr {
+                let meta = &n["meta"];
+                out.push(NewsItem {
+                    id: Self::u64_field(n, "id"),
+                    title: Self::str_field(n, "title"),
+                    body: Self::str_field(n, "body"),
+                    created_at: Self::str_field(n, "created_at"),
+                    image: meta["image"]
+                        .as_str()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                    backdrop: meta["backdrop"]
+                        .as_str()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                });
+            }
+        }
+        Ok((out, total, last))
+    }
+
+    /// Haftalık yayın takvimi → günler + bölümler. 1 saat önbellekli.
+    /// Herkese açık. (Lowell uyarlaması.)
+    pub fn calendar(&self) -> Result<Vec<CalendarDay>, String> {
+        let d = self.cache_get("calendar", 3600, |http| {
+            http.get(format!("{BASE}/secure/calendar"))
+                .header("Accept", "application/json")
+                .send()
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?
+                .json()
+                .map_err(|e| e.to_string())
+        })?;
+        let mut days = Vec::new();
+        if let Some(arr) = d["data"].as_array() {
+            for day in arr {
+                let mut eps = Vec::new();
+                if let Some(eparr) = day["episodes"].as_array() {
+                    for e in eparr {
+                        let title = Title::from_value(&e["title"]).unwrap_or(Title {
+                            id: Self::u64_field(e, "title_id"),
+                            ..Default::default()
+                        });
+                        eps.push(CalendarEpisode {
+                            title,
+                            season: Self::u64_field(e, "season_number"),
+                            episode: Self::u64_field(e, "episode_number"),
+                            name: Self::str_field(e, "name"),
+                            description: Self::str_field(e, "description"),
+                            poster: e["poster"]
+                                .as_str()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty()),
+                            release_date: Self::str_field(e, "release_date"),
+                        });
+                    }
+                }
+                // Günü yayın saatine göre sırala (sabah → gece).
+                eps.sort_by(|a, b| a.release_date.cmp(&b.release_date));
+                days.push(CalendarDay {
+                    date: Self::str_field(day, "date"),
+                    episodes: eps,
+                });
+            }
+        }
+        Ok(days)
+    }
+
+    /// Son eklenen bölümler (1-indexli sayfa) → (öğeler, toplam, son_sayfa).
+    /// Herkese açık. 15 dk önbellekli. (Lowell uyarlaması.)
+    pub fn last_episodes(&self, page: u32) -> Result<(Vec<LastEpisode>, usize, u32), String> {
+        let page = page.max(1);
+        let key = format!("lastep:{page}");
+        let d = self.cache_get(&key, 900, |http| {
+            http.get(format!("{BASE}/secure/last-episodes"))
+                .header("Accept", "application/json")
+                .query(&[("page", &page.to_string())])
+                .send()
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?
+                .json()
+                .map_err(|e| e.to_string())
+        })?;
+        let total = d["total"].as_u64().unwrap_or(0) as usize;
+        let last = d["last_page"].as_u64().unwrap_or(1).max(1) as u32;
+        let mut out = Vec::new();
+        if let Some(arr) = d["data"].as_array() {
+            for e in arr {
+                out.push(LastEpisode {
+                    title_id: Self::u64_field(e, "title_id"),
+                    title_name: Self::str_field(e, "title_name"),
+                    title_poster: e["title_poster"]
+                        .as_str()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                    title_type: e["title_type"]
+                        .as_str()
+                        .map(|s| s.to_string()),
+                    season: Self::u64_field(e, "season_number"),
+                    episode: Self::u64_field(e, "episode_number"),
+                    release_date: Self::str_field(e, "release_date"),
+                });
+            }
+        }
+        Ok((out, total, last))
+    }
+
+    /// Site istek imzası (X-E-H): AES-256-GCM ile sorgu imzalama.
+/// (Lowell137/animecix-linux, MIT lisanslı uyarlama.)
+///
+/// Angular istemcinin birebir kopyasıdır:
+/// - düz metin: `"{version}" + sorgu-dizesi`
+/// - anahtar: 32 bayt ASCII birleşimi (AES-256)
+/// - değer: `base64(sifreli).base64(iv)` (12 bayt rastgele IV)
+/// - başlık adı: `X-E-H`
+fn sign_query(query: &str) -> Result<String, String> {
+    use base64::Engine as _;
+    use ring::{aead, rand::SecureRandom};
+    const KEY: &[u8; 32] = b"i4C7R2fXGocdYgFLzCbDlsJjukf8G58b";
+    let rng = ring::rand::SystemRandom::new();
+    let mut iv = [0u8; 12];
+    rng.fill(&mut iv)
+        .map_err(|_| "rastgele IV üretilemedi".to_string())?;
+    let key = aead::LessSafeKey::new(
+        aead::UnboundKey::new(&aead::AES_256_GCM, KEY)
+            .map_err(|_| "imza anahtarı geçersiz".to_string())?,
+    );
+    let mut data = format!("{{version}}{query}").into_bytes();
+    key.seal_in_place_append_tag(
+        aead::Nonce::assume_unique_for_key(iv),
+        aead::Aad::empty(),
+        &mut data,
+    )
+    .map_err(|_| "istek imzalanamadı".to_string())?;
+    let eng = base64::engine::general_purpose::STANDARD;
+    Ok(format!("{}.{}", eng.encode(&data), eng.encode(iv)))
+}
+
+/// Keşfet kataloğu: `/secure/titles` + X-E-H imzası (siteyle aynı).
+    /// Sayfa 1-indexli. 1 saat önbellekli. (Lowell uyarlaması.)
+    pub fn discover(&self, f: &DiscoverFilter) -> Result<(Vec<Title>, usize, u32), String> {
+        let page = f.page.max(1);
+        let mut q = String::new();
+        let mut push = |k: &str, v: &str| {
+            if !q.is_empty() {
+                q.push('&');
+            }
+            q.push_str(k);
+            q.push('=');
+            q.push_str(v);
+        };
+        if let Some(t) = &f.title_type {
+            push("type", t);
+        }
+        if !f.genres.is_empty() {
+            push("genre", &f.genres.join(","));
+        }
+        if !f.keywords.is_empty() {
+            push("keyword", &f.keywords.join(","));
+        }
+        if let Some(o) = &f.order {
+            push("order", o);
+        }
+        if f.only_streamable {
+            push("onlyStreamable", "true");
+        }
+        push("page", &page.to_string());
+        push("perPage", "20");
+        let key = format!("discover:{q}");
+        let d = self.cache_get(&key, 3600, |http| {
+            let sig = Self::sign_query(&q)?;
+            http.get(format!("{BASE}/secure/titles?{q}"))
+                .header("Accept", "application/json")
+                .header("X-Requested-With", "XMLHttpRequest")
+                .header("X-E-H", &sig)
+                .send()
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?
+                .json()
+                .map_err(|e| e.to_string())
+        })?;
+        let pg = &d["pagination"];
+        let pg = if pg.is_object() { pg } else { &d };
+        let total = pg["total"]
+            .as_u64()
+            .or_else(|| pg["totalData"].as_u64())
+            .or_else(|| pg["totalCount"].as_u64())
+            .unwrap_or(0) as usize;
+        let last = pg["last_page"]
+            .as_u64()
+            .or_else(|| pg["lastPage"].as_u64())
+            .unwrap_or(1)
+            .max(1) as u32;
+        let mut out = Vec::new();
+        let arr = pg["data"]
+            .as_array()
+            .or_else(|| pg["items"].as_array())
+            .or_else(|| pg["titles"].as_array());
+        if let Some(arr) = arr {
+            // Serde değil from_value: türler obje-dizisi, puanlar string
+            // gelebiliyor; katı Deserialize 19/20 öğeyi eliyor (canlı bulgu).
+            for v in arr {
+                if let Some(t) = Title::from_value(v) {
+                    out.push(t);
+                }
+            }
+        }
+        Ok((out, total, last))
     }
 
     pub fn enrich_title(&self, t: &Title) -> Title {
@@ -2848,10 +3347,21 @@ impl Client {
 
     pub fn load_settings(&self) -> Settings {
         let p = Self::settings_path();
-        std::fs::read_to_string(&p)
+        let mut s: Settings = std::fs::read_to_string(&p)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        Self::normalize_settings(&mut s);
+        s
+    }
+
+    /// Ayar aralığı bekçisi: ölçek 100-125'e kelepçelenir (eski %150
+    /// kayıtları tavana çekilir), haber fontu bilinen değere düşer.
+    pub fn normalize_settings(s: &mut Settings) {
+        s.ui_scale = s.ui_scale.clamp(1.0, 1.25);
+        if !matches!(s.news_font_size.as_str(), "small" | "normal" | "large") {
+            s.news_font_size = default_news_font();
+        }
     }
 
     pub fn save_settings(&self, s: &Settings) {
@@ -2885,6 +3395,12 @@ impl Client {
         let dir = self.cache_dir.join("covers");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
+    }
+
+    /// Kapak wipe'ı ister: bayrak dosyası yazar, silme işini yeni proses
+    /// açılışta yapar (havadaki indirmelerle yarışmaz).
+    pub fn request_covers_wipe(&self) {
+        let _ = std::fs::write(self.cache_dir.join(WIPE_FLAG_FILE), "");
     }
 
     pub fn wipe_all_data(&self) {        if let Ok(mut c) = self.cache.lock() { c.clear(); }
@@ -3139,6 +3655,7 @@ mod tests {
         });
         let t = Title::from_value(&v).unwrap();
         assert_eq!(t.display_name(), "Sousou no Frieren (2023)");
+        assert_eq!(t.backdrop, None, "fixture'da backdrop yok");
         assert_eq!(
             t.genre_line(),
             Some("Dram  •  Bilim Kurgu & Fantezi  •  Aksiyon & Macera".to_string())
@@ -3154,8 +3671,144 @@ mod tests {
     }
 
     #[test]
-    fn enrich_title_short_circuits_when_populated() {
-        let c = Client::new();
+    fn wipe_flag_cycle() {
+        // Sahte cache dizini: bayrak + eski kapak dosyası.
+        let dir = std::env::temp_dir().join(format!("animecix-wipe-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("covers")).unwrap();
+        std::fs::write(dir.join("covers").join("eski.bin"), b"eski").unwrap();
+        assert!(!super::consume_wipe_flag(&dir), "bayrak yoksa false");
+        std::fs::write(dir.join("covers_wipe_pending"), b"").unwrap();
+        assert!(super::consume_wipe_flag(&dir), "bayrak varsa true");
+        assert!(!dir.join("covers").join("eski.bin").exists(), "eski dosya gitmeli");
+        assert!(dir.join("covers").is_dir(), "dizin yeniden açılmalı");
+        assert!(!dir.join("covers_wipe_pending").exists(), "bayrak kalkmalı");
+        assert!(!super::consume_wipe_flag(&dir), "ikinci çağrı false");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sign_roundtrip_decrypts() {
+        use base64::Engine as _;
+        let query = "genre=drama,action&onlyStreamable=true&page=1&perPage=16";
+        let v = super::Client::sign_query(query).unwrap();
+        let mut it = v.split('.');
+        let ct_b64 = it.next().unwrap();
+        let iv_b64 = it.next().unwrap();
+        assert!(it.next().is_none(), "iki parçalı olmalı");
+        let eng = base64::engine::general_purpose::STANDARD;
+        let iv: [u8; 12] = eng
+            .decode(iv_b64)
+            .unwrap()
+            .try_into()
+            .expect("12 bayt IV");
+        let key = ring::aead::LessSafeKey::new(
+            ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, b"i4C7R2fXGocdYgFLzCbDlsJjukf8G58b").unwrap(),
+        );
+        let mut data = eng.decode(ct_b64).unwrap();
+        let pt = key
+            .open_in_place(
+                ring::aead::Nonce::assume_unique_for_key(iv),
+                ring::aead::Aad::empty(),
+                &mut data,
+            )
+            .unwrap();
+        assert_eq!(pt, format!("{{version}}{query}").as_bytes());
+    }
+
+    #[test]
+    fn news_shape_parses() {
+        let n = serde_json::json!({
+            "id": 401, "title": "T", "body": "B",
+            "created_at": "2026-09-30T00:00:00.000Z",
+            "meta": {"image": "https://x/i.png", "backdrop": ""}
+        });
+        assert_eq!(super::Client::u64_field(&n, "id"), 401);
+        assert_eq!(super::Client::str_field(&n, "title"), "T");
+        assert!(n["meta"]["backdrop"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn split_iso_parses_and_adds_3h() {
+        assert_eq!(
+            super::split_iso("2026-09-07T17:00:00.000Z"),
+            Some((2026, 9, 7, 20, 0))
+        );
+        assert!(super::split_iso("bozuk").is_none());
+        assert!(super::split_iso("2026-09-07").is_none());
+    }
+
+    #[test]
+    fn last_episode_ref_title() {
+        let e = super::LastEpisode {
+            title_id: 5,
+            title_name: "".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(e.ref_title().name, "Anime #5");
+        // LastEpisode Default ile kurulabilmeli (serde default'ları).
+        let e2 = super::LastEpisode::default();
+        assert_eq!(e2.season, 0);
+    }
+
+    #[test]
+    fn display_genre_skips_technical() {
+        let t = |gs: &[&str]| Title {
+            genres: Some(gs.iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
+        };
+        assert_eq!(
+            t(&["animation", "action"]).display_genre().as_deref(),
+            Some("Aksiyon")
+        );
+        assert_eq!(t(&["animation"]).display_genre(), None);
+        assert_eq!(t(&[]).display_genre(), None);
+        let none = Title { genres: None, ..Default::default() };
+        assert_eq!(none.display_genre(), None);
+    }
+
+    #[test]
+    fn card_subtitle_falls_back() {
+        let t = |gs: &[&str], year: Option<i64>, tt: Option<&str>| Title {
+            genres: Some(gs.iter().map(|s| s.to_string()).collect()),
+            year,
+            title_type: tt.map(|s| s.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(t(&["action"], None, None).card_subtitle(), "Aksiyon");
+        assert_eq!(t(&["animation"], Some(2023), None).card_subtitle(), "2023");
+        assert_eq!(t(&[], None, Some("movie")).card_subtitle(), "Film");
+        assert_eq!(t(&[], None, None).card_subtitle(), " ");
+    }
+
+    #[test]
+    fn from_value_reads_backdrop() {
+        let v = serde_json::json!({
+            "id": 7,
+            "name": "X",
+            "poster": "https://img/p.jpg",
+            "backdrop": "https://img/b.jpg"
+        });
+        let t = Title::from_value(&v).unwrap();
+        assert_eq!(t.backdrop.as_deref(), Some("https://img/b.jpg"));
+        assert_eq!(t.poster.as_deref(), Some("https://img/p.jpg"));
+        assert_eq!(t.rating, None, "puan yoksa None");
+        let v2 = serde_json::json!({"id": 8, "name": "Y", "tmdb_vote_average": 8.43});
+        assert_eq!(
+            Title::from_value(&v2).unwrap().rating,
+            Some(8.43),
+            "tmdb puanı okunmalı"
+        );
+        let v3 = serde_json::json!({"id": 9, "name": "Z", "local_vote_average": 7.0});
+        assert_eq!(
+            Title::from_value(&v3).unwrap().rating,
+            Some(7.0),
+            "yedek yerel puan okunmalı"
+        );
+    }
+
+    #[test]
+    fn enrich_title_short_circuits_when_populated() {        let c = Client::new();
         let mut t = sample("anime", Some(2021), Some(2));
         t.genres = Some(vec!["Dram".to_string()]);
         let e = c.enrich_title(&t);
@@ -3428,17 +4081,17 @@ mod tests {
     }
 
     #[test]
-    fn stored_image_zstd_roundtrip() {
+    fn stored_image_raw_roundtrip() {
+        // zstd kaldırıldı: kapak baytları ham tutulur.
         let raw = vec![0xAB; 4096];
         let enc = encode_stored_image(&raw);
-        assert_eq!(&enc[0..4], &ZSTD_IMG_MAGIC, "zstd çerçevesi yazılmalı");
-        assert!(enc.len() < raw.len(), "tekrarlı bayt küçülmeli");
+        assert_eq!(enc, raw, "ham bayt aynen yazılmalı");
         assert_eq!(decode_stored_image(&enc).as_deref(), Some(raw.as_slice()));
     }
 
     #[test]
     fn stored_image_legacy_raw_passthrough() {
-        // Eski (sıkıştırmasız) disk dosyaları okunmaya devam etmeli.
+        // Disk dosyaları ham okunur.
         let raw = vec![1, 2, 3, 4, 5];
         assert_eq!(decode_stored_image(&raw).as_deref(), Some(raw.as_slice()));
         assert!(decode_stored_image(&[]).is_some());
@@ -3462,6 +4115,28 @@ mod tests {
         assert!((s.ui_scale - 1.0).abs() < f32::EPSILON);
         let old: Settings = serde_json::from_str("{}").unwrap();
         assert!((old.ui_scale - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn settings_scale_clamps_to_100_125_and_news_font_roundtrips() {
+        // Eski %150 kaydı tavana çekilir (normalize load'da olur; burada
+        // sınır davranışı belgelenir).
+        assert_eq!(1.5f32.clamp(1.0, 1.25), 1.25);
+        assert_eq!(0.5f32.clamp(1.0, 1.25), 1.0);
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.news_font_size, "normal", "eski ayar dosyasına normal düşmeli");
+        let mut s = Settings::default();
+        assert_eq!(s.news_font_size, "normal");
+        s.news_font_size = "large".into();
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.news_font_size, "large");
+        // Bozuk değer normalize edilir.
+        let mut bad = Settings::default();
+        bad.news_font_size = "devasa".into();
+        bad.ui_scale = 9.0;
+        Client::normalize_settings(&mut bad);
+        assert_eq!(bad.ui_scale, 1.25);
+        assert_eq!(bad.news_font_size, "normal");
     }
 
     #[test]
@@ -3530,17 +4205,6 @@ mod tests {
         s.official_skip_secret = "SIR".into();
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.official_skip_secret, "SIR");
-    }
-
-    #[test]
-    fn settings_tools_shortcut_defaults_and_roundtrips() {
-        let old: Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(old.tools_shortcut, "Ctrl+T", "eski ayar dosyası varsayılana düşmeli");
-        let mut s = Settings::default();
-        assert_eq!(s.tools_shortcut, "Ctrl+T");
-        s.tools_shortcut = "Alt+T".into();
-        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
-        assert_eq!(back.tools_shortcut, "Alt+T");
     }
 
     #[test]
@@ -3992,6 +4656,16 @@ mod live_tests {
         let r = c.search("one piece").expect("search basarisiz");
         println!("sonuc: {}", r.len());
         assert!(!r.is_empty());
+    }
+
+    #[test]
+    #[ignore] // canlı: imzalı discover şeklini kilitler.
+    fn discover_live() {
+        let c = Client::new();
+        let f = DiscoverFilter { page: 1, ..Default::default() };
+        let (items, total, last) = c.discover(&f).expect("discover basarisiz");
+        println!("kesfet: {} öğe, toplam {total}, son {last}", items.len());
+        assert!(!items.is_empty(), "imzalı discover boş dönmemeli");
     }
 }
 

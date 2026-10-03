@@ -13,7 +13,6 @@ favoriler_kapak_gecmisi.md
 *.AppImage
 AnimeciX.AppDir/
 appimagetool-x86_64.AppImage
-assets/hicolor/index.theme
 
 # === Kalıntı / scratch dosyalar (yalnızca local'de kalır) ===
 HANDOVER.md
