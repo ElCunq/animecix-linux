@@ -392,6 +392,24 @@ pub struct Settings {
     /// İndirme klasörü (boşsa Videolar/Animecix).
     #[serde(default)]
     pub download_dir: Option<String>,
+    /// AnimeciX kullanıcı oturum çerezi (connect.sid)
+    #[serde(default)]
+    pub connect_sid: String,
+    /// AnimeciX XSRF token
+    #[serde(default)]
+    pub xsrf_token: String,
+    /// Oturum açmış AnimeciX kullanıcı profili
+    #[serde(default)]
+    pub user_profile: Option<UserProfile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct UserProfile {
+    pub id: u64,
+    pub username: String,
+    pub display_name: String,
+    pub avatar: Option<String>,
+    pub email: Option<String>,
 }
 fn default_loading() -> String { "overlay".into() }
 fn default_quick_search() -> bool { true }
@@ -798,6 +816,9 @@ impl Default for Settings {
             theme: default_theme(),
             cover_quality: default_cover_quality(),
             download_dir: None,
+            connect_sid: String::new(),
+            xsrf_token: String::new(),
+            user_profile: None,
         }
     }
 }
@@ -911,13 +932,21 @@ impl Client {
             vault: std::sync::Mutex::new((0, String::new())),
             cover_quality_mem: std::sync::Mutex::new(default_cover_quality()),
         };
-        c.http.set_cf_clearance(&c.load_settings().cf_clearance);
-        c.remember_cover_quality(&c.load_settings().cover_quality);
+        let s = c.load_settings();
+        c.http.set_cf_clearance(&s.cf_clearance);
+        c.http.set_connect_sid(&s.connect_sid);
+        c.http.set_xsrf_token(&s.xsrf_token);
+        c.remember_cover_quality(&s.cover_quality);
         c
     }
 
     pub fn set_cf_clearance(&self, v: &str) {
         self.http.set_cf_clearance(v);
+    }
+
+    pub fn set_session(&self, connect_sid: &str, xsrf_token: &str) {
+        self.http.set_connect_sid(connect_sid);
+        self.http.set_xsrf_token(xsrf_token);
     }
 
     pub fn load_translators(&self) -> Result<(), String> {
@@ -2808,10 +2837,37 @@ impl Client {
                     .unwrap_or(0),
             },
         );
-        if st.history.len() > 30 {
-            st.history.truncate(30);
+        st.history.sort_by(|a, b| b.ts.cmp(&a.ts));
+        if st.history.len() > 500 {
+            st.history.truncate(500);
         }
         self.save_state(&st);
+
+        if self.is_logged_in() {
+            let http = self.http.clone();
+            let body = serde_json::json!({
+                "id": t.id,
+                "name": t.name,
+                "poster": t.poster,
+                "title_type": t.title_type,
+                "year": t.year,
+                "season_count": t.season_count,
+                "season": {
+                    "number": e.season,
+                    "season_number": e.season,
+                    "episodes": [{
+                        "episode_number": e.episode,
+                        "season_number": e.season,
+                    }]
+                }
+            });
+            std::thread::spawn(move || {
+                let _ = http.post(format!("{BASE}/secure/history/put-title"))
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send();
+            });
+        }
     }
 
 
@@ -2860,6 +2916,9 @@ impl Client {
             std::fs::create_dir_all(parent).ok();
         }
         let _ = std::fs::write(&p, serde_json::to_string_pretty(s).unwrap_or_default());
+        self.http.set_cf_clearance(&s.cf_clearance);
+        self.http.set_connect_sid(&s.connect_sid);
+        self.http.set_xsrf_token(&s.xsrf_token);
         self.remember_cover_quality(&s.cover_quality);
     }
 
@@ -2968,6 +3027,535 @@ impl Client {
     pub fn get_progress(&self, tid: u64, season: u64, episode: u64) -> Option<(f64, f64)> {
         let key = format!("{tid}:{season}:{episode}");
         self.load_state().progress.get(&key).copied()
+    }
+
+    pub fn is_logged_in(&self) -> bool {
+        let s = self.load_settings();
+        !s.connect_sid.is_empty() && s.user_profile.is_some()
+    }
+
+    pub fn current_user(&self) -> Option<UserProfile> {
+        self.load_settings().user_profile
+    }
+
+    /// E-posta ve şifre ile AnimeciX'e doğrudan giriş yapar.
+    pub fn login(&self, email: &str, password: &str) -> Result<UserProfile, String> {
+        let body = serde_json::json!({
+            "email": email.trim(),
+            "password": password,
+            "remember": true
+        });
+        let resp = self.http.post(format!("{BASE}/secure/auth/login"))
+            .header("Content-Type", "application/json")
+            .header("Origin", BASE)
+            .header("Referer", "https://animecix.tv/")
+            .json(&body)
+            .send()
+            .map_err(|e| format!("Giriş isteği başarısız: {e}"))?;
+
+        if resp.status() == 403 {
+            return Err("Cloudflare engeliyle karşılaşıldı. Lütfen Ayarlar'dan 'Çerez ile Bağla' seçeneğini kullanarak tarayıcınızdaki connect.sid ile bağlanın.".into());
+        }
+
+        let sid = resp.set_cookie_val("connect.sid");
+        let xsrf = resp.set_cookie_val("XSRF-TOKEN");
+
+        let val: serde_json::Value = resp.json().map_err(|e| format!("Yanıt JSON olarak okunamadı: {e}"))?;
+        if val.get("success").and_then(|s| s.as_bool()) != Some(true) {
+            let msg = val.get("message").and_then(|m| m.as_str()).unwrap_or("Giriş bilgileri hatalı veya kullanıcı bulunamadı");
+            return Err(msg.to_string());
+        }
+
+        let user_val = val.get("user").ok_or_else(|| "Kullanıcı bilgisi yanıtta bulunamadı".to_string())?;
+        let user = parse_user_profile(user_val);
+
+        let mut s = self.load_settings();
+        if let Some(sid) = sid {
+            s.connect_sid = sid;
+        }
+        if let Some(xsrf) = xsrf {
+            s.xsrf_token = xsrf;
+        }
+        s.user_profile = Some(user.clone());
+        self.save_settings(&s);
+
+        // Arka planda geçmişi eşitle
+        let _ = self.sync_cloud_history();
+
+        Ok(user)
+    }
+
+    pub fn extract_cookie_val(raw: &str, cookie_name: &str) -> Option<String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        for part in raw.split(';') {
+            let part = part.trim();
+            let part = part.strip_prefix("Cookie:").unwrap_or(part).trim();
+            let part = part.strip_prefix("cookie:").unwrap_or(part).trim();
+            if let Some((k, v)) = part.split_once('=') {
+                if k.trim().eq_ignore_ascii_case(cookie_name) {
+                    let v = v.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !v.is_empty() {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn sanitize_cookie_param(raw: &str, cookie_name: &str) -> String {
+        let mut s = raw.trim();
+        if s.is_empty() {
+            return String::new();
+        }
+        if let Some(stripped) = s.strip_prefix("Cookie:").or_else(|| s.strip_prefix("cookie:")) {
+            s = stripped.trim();
+        }
+        if let Some(val) = Self::extract_cookie_val(s, cookie_name) {
+            return val;
+        }
+        let prefix = format!("{cookie_name}=");
+        if let Some(stripped) = s.strip_prefix(&prefix) {
+            s = stripped.trim();
+        }
+        if let Some((val, _)) = s.split_once(';') {
+            s = val.trim();
+        }
+        s.trim_matches('"').trim_matches('\'').trim().to_string()
+    }
+
+    /// Çerez (connect.sid) ile oturum bağlar ve bootstrap-data ile doğrular.
+    pub fn login_with_cookie(&self, connect_sid: &str, xsrf_token: Option<&str>, cf_clearance: Option<&str>) -> Result<UserProfile, String> {
+        let sid = Self::sanitize_cookie_param(connect_sid, "connect.sid");
+        let mut xsrf = xsrf_token.map(|x| Self::sanitize_cookie_param(x, "XSRF-TOKEN")).unwrap_or_default();
+        let mut cf = cf_clearance.map(|x| Self::sanitize_cookie_param(x, "cf_clearance")).unwrap_or_default();
+
+        if xsrf.is_empty() {
+            if let Some(extracted) = Self::extract_cookie_val(connect_sid, "XSRF-TOKEN") {
+                xsrf = extracted;
+            }
+        }
+        if cf.is_empty() {
+            if let Some(extracted) = Self::extract_cookie_val(connect_sid, "cf_clearance") {
+                cf = extracted;
+            }
+        }
+
+        if sid.is_empty() {
+            return Err("connect.sid çerezi bulunamadı veya boş".into());
+        }
+        if !cf.is_empty() {
+            self.set_cf_clearance(&cf);
+        }
+        self.http.set_connect_sid(&sid);
+        self.http.set_xsrf_token(&xsrf);
+
+        let resp = self.http.get(format!("{BASE}/secure/bootstrap-data"))
+            .header("Referer", "https://animecix.tv/")
+            .send()
+            .map_err(|e| format!("Oturum doğrulama isteği başarısız: {e}"))?;
+
+        if resp.status() == 403 {
+            return Err("Cloudflare engeline takıldı. Güncel bir cf_clearance bileti girmeniz gerekebilir.".into());
+        }
+
+        let root: serde_json::Value = resp.json().map_err(|e| format!("Yanıt okunamadı: {e}"))?;
+        let data_b64 = root.get("data").and_then(|d| d.as_str()).ok_or_else(|| "bootstrap verisi yok".to_string())?;
+
+        let decoded_bytes = base64_decode(data_b64).map_err(|e| format!("Base64 çözülemedi: {e}"))?;
+        let decoded_str = String::from_utf8(decoded_bytes).map_err(|_| "Geçersiz UTF-8".to_string())?;
+        let unquoted = percent_decode_str(&decoded_str);
+        let parsed: serde_json::Value = serde_json::from_str(&unquoted).map_err(|e| format!("JSON ayrıştırılamadı: {e}"))?;
+
+        let user_val = parsed.get("user");
+        if user_val.is_none() || user_val.unwrap().is_null() {
+            return Err("Oturum çerezi geçersiz veya süresi dolmuş. Kullanıcı bulunamadı.".into());
+        }
+        let user = parse_user_profile(user_val.unwrap());
+
+        let mut s = self.load_settings();
+        s.connect_sid = sid;
+        if !xsrf.is_empty() {
+            s.xsrf_token = xsrf;
+        }
+        if let Some(cf) = cf_clearance {
+            s.cf_clearance = cf.trim().to_string();
+        }
+        s.user_profile = Some(user.clone());
+        self.save_settings(&s);
+
+        // Arka planda geçmişi eşitle
+        let _ = self.sync_cloud_history();
+
+        Ok(user)
+    }
+
+    pub fn logout(&self) {
+        let mut s = self.load_settings();
+        s.connect_sid.clear();
+        s.xsrf_token.clear();
+        s.user_profile = None;
+        self.save_settings(&s);
+    }
+
+    /// Buluttan kaldığın yeri sorgular (saniye cinsinden döner).
+    pub fn get_cloud_progress(&self, title_id: u64, season: u64, episode: u64) -> Option<f64> {
+        if !self.is_logged_in() {
+            return None;
+        }
+        let body = serde_json::json!({
+            "titleId": title_id,
+            "seasonNumber": season,
+            "episodeNumber": episode
+        });
+        let resp = self.http.post(format!("{BASE}/secure/history/get-current-time"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .ok()?;
+        if (200..300).contains(&resp.status()) {
+            let val: serde_json::Value = resp.json().ok()?;
+            let ms = val.get("time").and_then(|t| t.as_f64()).unwrap_or(0.0);
+            if ms > 0.0 {
+                let secs = ms / 1000.0;
+                let key = format!("{title_id}:{season}:{episode}");
+                let mut st = self.load_state();
+                let dur = st.progress.get(&key).map(|(_, d)| *d).unwrap_or(0.0);
+                st.progress.insert(key, (secs, dur));
+                self.save_state(&st);
+                return Some(secs);
+            }
+        }
+        None
+    }
+
+    /// Buluta izleme konumunu bildirir (saniye cinsinden alır, ms olarak gönderir).
+    pub fn report_cloud_progress(&self, title_id: u64, season: u64, episode: u64, pos_secs: f64) -> Result<(), String> {
+        if !self.is_logged_in() {
+            return Ok(());
+        }
+        let body = serde_json::json!({
+            "titleId": title_id,
+            "seasonNumber": season,
+            "episodeNumber": episode,
+            "time": (pos_secs * 1000.0) as u64
+        });
+        let resp = self.http.post(format!("{BASE}/secure/history/report-current-time"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .map_err(|e| format!("İlerleme bildirilemedi: {e}"))?;
+        if (200..300).contains(&resp.status()) {
+            Ok(())
+        } else {
+            Err(format!("Bulut ilerleme hatası: HTTP {}", resp.status()))
+        }
+    }
+
+    /// Bulutta geçmişe başlığı ekler (put-title).
+    pub fn cloud_put_title(&self, title: &Title, episode_num: u64, season_num: u64) {
+        if !self.is_logged_in() {
+            return;
+        }
+        let body = serde_json::json!({
+            "id": title.id,
+            "name": title.name,
+            "poster": title.poster,
+            "title_type": title.title_type,
+            "year": title.year,
+            "season_count": title.season_count,
+            "season": {
+                "number": season_num,
+                "season_number": season_num,
+                "episodes": [{
+                    "episode_number": episode_num,
+                    "season_number": season_num,
+                }]
+            }
+        });
+        let _ = self.http.post(format!("{BASE}/secure/history/put-title"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send();
+    }
+
+    /// Buluttaki izleme geçmişini yerel state ile eşitler (fetch & merge).
+    pub fn sync_cloud_history(&self) -> Result<usize, String> {
+        if !self.is_logged_in() {
+            return Err("Oturum açılmamış".into());
+        }
+
+        // Sayfa 0'ı çek (AnimeciX API sayfalama 0 tabanlıdır; 0 en son izlenenleri içerir)
+        let resp = self.http.get(format!("{BASE}/secure/history/get-titles?page=0&query="))
+            .header("Referer", "https://animecix.tv/")
+            .send()
+            .map_err(|e| format!("Geçmiş çekilemedi: {e}"))?;
+        let val: serde_json::Value = resp.json().map_err(|e| format!("Geçmiş JSON çözülemedi: {e}"))?;
+
+        let total_count = val.get("data")
+            .and_then(|d| d.get("totalCount"))
+            .and_then(|tc| tc.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|o| o.get("count"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or(10);
+
+        let max_pages = ((total_count + 9) / 10).min(35);
+
+        let mut st = self.load_state();
+        let mut new_entries = Vec::new();
+
+        let process_batch = |titles_arr: &[serde_json::Value], st_prog: &mut std::collections::HashMap<String, (f64, f64)>, out: &mut Vec<HistoryEntry>| {
+            for item in titles_arr {
+                if let Some(t_obj) = item.as_object() {
+                    let id = t_obj.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let name = t_obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if id == 0 || name.is_empty() {
+                        continue;
+                    }
+                    let poster = t_obj.get("poster").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let title_type = t_obj.get("title_type").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let title = Title {
+                        id,
+                        name,
+                        poster,
+                        title_type: title_type.clone(),
+                        year: t_obj.get("year").and_then(|v| v.as_i64()),
+                        season_count: t_obj.get("season_count").and_then(|v| v.as_i64()),
+                        episode_count: t_obj.get("episode_count").and_then(|v| v.as_i64()),
+                        description: t_obj.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        genres: t_obj.get("genres").and_then(|v| v.as_array()).map(|arr| {
+                            arr.iter().filter_map(|g| g.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())).collect()
+                        }),
+                        runtime: t_obj.get("runtime").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))),
+                        release_date: t_obj.get("release_date").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        ..Default::default()
+                    };
+
+                    let vid_obj = t_obj.get("videos")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first());
+
+                    let (vid_s, vid_ep, vid_name) = if let Some(v) = vid_obj {
+                        let s = v.get("season_num").and_then(|x| x.as_u64());
+                        let ep = v.get("episode_num").and_then(|x| x.as_u64());
+                        let n = v.get("name").and_then(|x| x.as_str()).map(|s| s.to_string());
+                        (s, ep, n)
+                    } else {
+                        (None, None, None)
+                    };
+
+                    let direct_ep_obj = t_obj.get("episodes")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first());
+
+                    let (dep_s, dep_ep, dep_name) = if let Some(e) = direct_ep_obj {
+                        let s = e.get("season_number").and_then(|x| x.as_u64());
+                        let ep = e.get("episode_number").and_then(|x| x.as_u64());
+                        let n = e.get("name").and_then(|x| x.as_str()).map(|s| s.to_string());
+                        (s, ep, n)
+                    } else {
+                        (None, None, None)
+                    };
+
+                    let season_obj = t_obj.get("season");
+                    let s_num_from_obj = season_obj
+                        .and_then(|s| s.get("number").or_else(|| s.get("season_number")))
+                        .and_then(|v| v.as_u64());
+
+                    let season_ep_obj = season_obj
+                        .and_then(|s| s.get("episodes"))
+                        .and_then(|eps| eps.as_array())
+                        .and_then(|arr| arr.last());
+
+                    let (sep_ep, sep_name) = if let Some(e) = season_ep_obj {
+                        let ep = e.get("episode_number").and_then(|x| x.as_u64());
+                        let n = e.get("name").and_then(|x| x.as_str()).map(|s| s.to_string());
+                        (ep, n)
+                    } else {
+                        (None, None)
+                    };
+
+                    let season_num = vid_s
+                        .or(dep_s)
+                        .or(s_num_from_obj)
+                        .unwrap_or(1);
+
+                    let ep_num = vid_ep
+                        .or(dep_ep)
+                        .or(sep_ep)
+                        .unwrap_or(1);
+
+                    let is_movie = title_type.as_deref() == Some("movie") || (season_num == 0 && ep_num == 0);
+
+                    let ep_name = vid_name
+                        .or(dep_name)
+                        .or(sep_name)
+                        .unwrap_or_else(|| if is_movie { "Film".to_string() } else { format!("{ep_num}. Bölüm") });
+
+                    let episode = Episode {
+                        episode: ep_num,
+                        season: season_num,
+                        name: ep_name,
+                    };
+
+                    let cur_time_ms = vid_obj.and_then(|v| v.get("currentTime")).and_then(|v| v.as_f64())
+                        .or_else(|| direct_ep_obj.and_then(|e| e.get("currentTime")).and_then(|v| v.as_f64()))
+                        .or_else(|| season_ep_obj.and_then(|e| e.get("currentTime")).and_then(|v| v.as_f64()))
+                        .or_else(|| t_obj.get("currentTime").and_then(|v| v.as_f64()))
+                        .unwrap_or(0.0);
+
+                    if cur_time_ms > 0.0 {
+                        let key = format!("{id}:{season_num}:{ep_num}");
+                        st_prog.insert(key, (cur_time_ms / 1000.0, 0.0));
+                    }
+
+                    // AnimeciX'teki gerçek izlenme zamanı ("date": timestamp_ms)
+                    let ts = t_obj.get("date")
+                        .and_then(|v| v.as_u64())
+                        .map(|ms| if ms > 1_000_000_000_000 { ms / 1000 } else { ms })
+                        .unwrap_or_else(now_secs);
+
+                    out.push(HistoryEntry {
+                        title,
+                        episode,
+                        ts,
+                    });
+                }
+            }
+        };
+
+        // Sayfa 0'ı işle
+        if let Some(titles) = val.get("data").and_then(|d| d.get("totalData")).and_then(|td| td.as_array()) {
+            process_batch(titles, &mut st.progress, &mut new_entries);
+        }
+
+        // Kalan sayfaları (Sayfa 1..max_pages) çek ve işle
+        for page in 1..max_pages {
+            let page_resp = match self.http.get(format!("{BASE}/secure/history/get-titles?page={page}&query="))
+                .header("Referer", "https://animecix.tv/")
+                .send() {
+                    Ok(r) if (200..300).contains(&r.status()) => r,
+                    _ => break,
+                };
+            let page_val: serde_json::Value = match page_resp.json() {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let titles = match page_val.get("data").and_then(|d| d.get("totalData")).and_then(|td| td.as_array()) {
+                Some(arr) if !arr.is_empty() => arr,
+                _ => break,
+            };
+            process_batch(titles, &mut st.progress, &mut new_entries);
+            if titles.len() < 10 {
+                break;
+            }
+        }
+
+        let count = new_entries.len();
+
+        // Mevcut geçmiş ile birleştir:
+        for entry in new_entries {
+            if let Some(pos) = st.history.iter().position(|h| h.title.id == entry.title.id) {
+                if entry.ts >= st.history[pos].ts {
+                    st.history[pos] = entry;
+                }
+            } else {
+                st.history.push(entry);
+            }
+        }
+
+        // En son izlenenden ilk izlenene (azalan tarih) göre sırala!
+        st.history.sort_by(|a, b| b.ts.cmp(&a.ts));
+
+        if st.history.len() > 500 {
+            st.history.truncate(500);
+        }
+
+        self.save_state(&st);
+        Ok(count)
+    }
+}
+
+fn parse_user_profile(user_val: &serde_json::Value) -> UserProfile {
+    let id = user_val.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+    let username = user_val.get("username").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let display_name = user_val.get("display_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(username.as_str())
+        .to_string();
+    let avatar = user_val.get("avatar")
+        .or_else(|| user_val.get("avatar_url"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let email = user_val.get("email").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    UserProfile {
+        id,
+        username,
+        display_name,
+        avatar,
+        email,
+    }
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.trim();
+    let mut buf = 0u32;
+    let mut bits = 0;
+    let mut out = Vec::new();
+    for b in s.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b'\r' | b'\n' | b' ' => continue,
+            _ => return Err("Geçersiz base64 karakteri".into()),
+        };
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Ok(out)
+}
+
+fn percent_decode_str(s: &str) -> String {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h1), Some(h2)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((h1 << 4) | h2);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -4095,5 +4683,70 @@ mod fansub_tests {
     #[test]
     fn keeps_shyphic_pair() {
         assert_eq!(clean_fansub_name("shyphic - Surui"), "shyphic - Surui");
+    }
+
+    #[test]
+    fn cookie_sanitization_extracts_from_various_formats() {
+        let raw1 = "s%3Aabc.123";
+        assert_eq!(Client::sanitize_cookie_param(raw1, "connect.sid"), "s%3Aabc.123");
+
+        let raw2 = "connect.sid=s%3Aabc.123";
+        assert_eq!(Client::sanitize_cookie_param(raw2, "connect.sid"), "s%3Aabc.123");
+
+        let raw3 = "Cookie: cf_clearance=cf1; connect.sid=s%3Aabc.123; XSRF-TOKEN=xsrf1";
+        assert_eq!(Client::extract_cookie_val(raw3, "connect.sid").as_deref(), Some("s%3Aabc.123"));
+        assert_eq!(Client::extract_cookie_val(raw3, "cf_clearance").as_deref(), Some("cf1"));
+        assert_eq!(Client::extract_cookie_val(raw3, "XSRF-TOKEN").as_deref(), Some("xsrf1"));
+    }
+
+    #[test]
+    fn history_prefers_videos_season_and_episode() {
+        let json_sample = serde_json::json!({
+            "id": 258,
+            "name": "Black Clover",
+            "date": 1791148530112u64,
+            "season": {
+                "number": 1,
+                "episodes": [
+                    { "episode_number": 1, "name": "Asta and Yuno" },
+                    { "episode_number": 2, "name": "The Boys' Promise" }
+                ]
+            },
+            "videos": [
+                {
+                    "season_num": 1,
+                    "episode_num": 129,
+                    "name": "129. Bölüm"
+                }
+            ]
+        });
+
+        let t_obj = json_sample.as_object().unwrap();
+        let vid_obj = t_obj.get("videos").and_then(|v| v.as_array()).and_then(|a| a.first());
+        let (vid_s, vid_ep, vid_name) = if let Some(v) = vid_obj {
+            let s = v.get("season_num").and_then(|x| x.as_u64());
+            let ep = v.get("episode_num").and_then(|x| x.as_u64());
+            let n = v.get("name").and_then(|x| x.as_str()).map(|s| s.to_string());
+            (s, ep, n)
+        } else {
+            (None, None, None)
+        };
+        assert_eq!(vid_s, Some(1));
+        assert_eq!(vid_ep, Some(129));
+        assert_eq!(vid_name.as_deref(), Some("129. Bölüm"));
+    }
+
+    #[test]
+    #[ignore]
+    fn live_sync_cloud_history() {
+        let c = Client::new();
+        if c.is_logged_in() {
+            let res = c.sync_cloud_history();
+            println!("Sync result: {:?}", res);
+            let st = c.load_state();
+            for (i, h) in st.history.iter().take(10).enumerate() {
+                println!("{}: {} -> S:{} B:{} (ts={})", i, h.title.name, h.episode.season, h.episode.episode, h.ts);
+            }
+        }
     }
 }

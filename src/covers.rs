@@ -167,7 +167,7 @@ impl CoverManager {
             });
 
             let this = self.clone_ref();
-            glib::idle_add_local(move || match rx.try_recv() {
+            glib::timeout_add_local(std::time::Duration::from_millis(15), move || match rx.try_recv() {
                 Ok((u, bytes)) => {
                     this.finish_cover(&u, bytes);
                     let curr = this.active.get();
@@ -177,7 +177,15 @@ impl CoverManager {
                     this.pump_covers();
                     glib::ControlFlow::Break
                 }
-                Err(_) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let curr = this.active.get();
+                    if curr > 0 {
+                        this.active.set(curr - 1);
+                    }
+                    this.pump_covers();
+                    glib::ControlFlow::Break
+                }
             });
         }
     }

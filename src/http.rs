@@ -20,6 +20,7 @@ struct RawResp {
     status: u16,
     url: String,
     content_length: Option<u64>,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -33,6 +34,8 @@ struct Inner {
     /// Kullanıcının tarayıcıdan aldığı cf_clearance bileti. Boşsa takılmaz.
     /// Değer ASLA log'a yazılmaz.
     cf_clearance: Mutex<String>,
+    connect_sid: Mutex<String>,
+    xsrf_token: Mutex<String>,
 }
 
 #[derive(Clone)]
@@ -55,6 +58,34 @@ impl Resp {
 
     pub fn content_length(&self) -> Option<u64> {
         self.raw.content_length
+    }
+
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.raw.headers
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.raw
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn set_cookie_val(&self, cookie_name: &str) -> Option<String> {
+        let prefix = format!("{cookie_name}=");
+        for (k, v) in &self.raw.headers {
+            if k.eq_ignore_ascii_case("set-cookie") {
+                if let Some(pos) = v.find(&prefix) {
+                    let rest = &v[pos + prefix.len()..];
+                    let val = rest.split(';').next().unwrap_or("").trim();
+                    if !val.is_empty() {
+                        return Some(val.to_string());
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn error_for_status(self) -> Result<Self, String> {
@@ -126,7 +157,14 @@ impl ReqB<'_> {
     }
 }
 
-fn exec_on(rt: &tokio::runtime::Runtime, client: &wreq::Client, spec: &Spec, clearance: &str) -> Result<RawResp, String> {
+fn exec_on(
+    rt: &tokio::runtime::Runtime,
+    client: &wreq::Client,
+    spec: &Spec,
+    clearance: &str,
+    connect_sid: &str,
+    xsrf_token: &str,
+) -> Result<RawResp, String> {
     let mut url = spec.url.clone();
     if let Some(q) = &spec.query {
         if !q.is_empty() {
@@ -140,9 +178,17 @@ fn exec_on(rt: &tokio::runtime::Runtime, client: &wreq::Client, spec: &Spec, cle
     }
     // Başlıklar özgün host'a göre.
     let mut extra: Vec<(String, String)> = browser_headers_for(&url, &spec.headers);
-    if let Some(c) = cookie_header_for(&url, &spec.headers, clearance) {
+    if let Some(c) = cookie_header_for(&url, &spec.headers, clearance, connect_sid, xsrf_token) {
         extra.push(("Cookie".to_string(), c));
     }
+    let is_animecix = url.contains("animecix.tv");
+    if is_animecix && !xsrf_token.is_empty() && !spec.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-xsrf-token")) {
+        extra.push(("X-XSRF-TOKEN".to_string(), xsrf_token.to_string()));
+    }
+    if is_animecix && matches!(spec.method, Method::Post) && !spec.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("origin")) {
+        extra.push(("Origin".to_string(), "https://animecix.tv".to_string()));
+    }
+
     let mut rb = match spec.method {
         Method::Get => client.get(&url),
         Method::Post => client.post(&url),
@@ -166,11 +212,18 @@ fn exec_on(rt: &tokio::runtime::Runtime, client: &wreq::Client, spec: &Spec, cle
     let status = resp.status().as_u16();
     let final_url = resp.uri().to_string();
     let content_length = resp.content_length();
+    let mut resp_headers = Vec::new();
+    for (name, value) in resp.headers() {
+        if let Ok(v) = value.to_str() {
+            resp_headers.push((name.as_str().to_string(), v.to_string()));
+        }
+    }
     let body = rt.block_on(resp.bytes()).map_err(|e| e.to_string())?.to_vec();
     Ok(RawResp {
         status,
         url: final_url,
         content_length,
+        headers: resp_headers,
         body,
     })
 }
@@ -185,7 +238,9 @@ fn exec_cascade(rt: &tokio::runtime::Runtime, inner: &Inner, spec: &Spec) -> Res
     let mut last: Option<Result<RawResp, String>> = None;
     for (idx, client) in order.iter().take(if inner.fallback.is_some() { 2 } else { 1 }) {
         let clearance = inner.cf_clearance.lock().map(|g| g.clone()).unwrap_or_default();
-        let res = exec_on(rt, client, &spec, &clearance);
+        let connect_sid = inner.connect_sid.lock().map(|g| g.clone()).unwrap_or_default();
+        let xsrf_token = inner.xsrf_token.lock().map(|g| g.clone()).unwrap_or_default();
+        let res = exec_on(rt, client, &spec, &clearance, &connect_sid, &xsrf_token);
         match &res {
             Ok(r) if r.status != 403 => {
                 inner.last_good.store(*idx, Ordering::Relaxed);
@@ -252,6 +307,8 @@ impl Http {
                 tx,
                 last_good: AtomicU8::new(0),
                 cf_clearance: Mutex::new(String::new()),
+                connect_sid: Mutex::new(String::new()),
+                xsrf_token: Mutex::new(String::new()),
             }),
         })
     }
@@ -265,6 +322,32 @@ impl Http {
         if let Ok(mut g) = self.inner.cf_clearance.lock() {
             *g = v.to_string();
         }
+    }
+
+    pub fn cf_clearance(&self) -> String {
+        self.inner.cf_clearance.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    pub fn set_connect_sid(&self, v: &str) {
+        let v = v.trim();
+        if let Ok(mut g) = self.inner.connect_sid.lock() {
+            *g = v.to_string();
+        }
+    }
+
+    pub fn connect_sid(&self) -> String {
+        self.inner.connect_sid.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    pub fn set_xsrf_token(&self, v: &str) {
+        let v = v.trim();
+        if let Ok(mut g) = self.inner.xsrf_token.lock() {
+            *g = v.to_string();
+        }
+    }
+
+    pub fn xsrf_token(&self) -> String {
+        self.inner.xsrf_token.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     pub fn get(&self, url: impl Into<String>) -> ReqB<'_> {
@@ -347,15 +430,14 @@ fn browser_headers_for(url: &str, existing: &[(String, String)]) -> Vec<(String,
 }
 
 /// animecix.tv isteklerine takılacak Cookie başlığının değerini üretir.
-/// Boş bilet, video-host'ları ve çağrıda zaten Cookie varsa None döner.
+/// Boş bilet/çerezler, video-host'ları ve çağrıda zaten Cookie varsa None döner.
 fn cookie_header_for(
     url: &str,
     existing: &[(String, String)],
     clearance: &str,
+    connect_sid: &str,
+    xsrf_token: &str,
 ) -> Option<String> {
-    if clearance.is_empty() {
-        return None;
-    }
     let host = url
         .split("//")
         .nth(1)
@@ -372,7 +454,21 @@ fn cookie_header_for(
     {
         return None;
     }
-    Some(format!("cf_clearance={clearance}"))
+    let mut parts = Vec::new();
+    if !clearance.is_empty() {
+        parts.push(format!("cf_clearance={clearance}"));
+    }
+    if !connect_sid.is_empty() {
+        parts.push(format!("connect.sid={connect_sid}"));
+    }
+    if !xsrf_token.is_empty() {
+        parts.push(format!("XSRF-TOKEN={xsrf_token}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
 }
 
 #[cfg(test)]
@@ -412,12 +508,15 @@ mod tests {
 
     #[test]
     fn clearance_cookie_attached_to_api_only() {
-        let v = cookie_header_for("https://animecix.tv/secure/search/x", &[], "BILET123");
+        let v = cookie_header_for("https://animecix.tv/secure/search/x", &[], "BILET123", "", "");
         assert_eq!(v.as_deref(), Some("cf_clearance=BILET123"));
-        assert!(cookie_header_for("https://animecix.tv/secure/search/x", &[], "").is_none());
-        assert!(cookie_header_for("https://video.sibnet.ru/v/1/2.mp4", &[], "BILET123").is_none());
-        assert!(cookie_header_for("https://tau-video.xyz/api/video/a", &[], "BILET123").is_none());
+        assert!(cookie_header_for("https://animecix.tv/secure/search/x", &[], "", "", "").is_none());
+        assert!(cookie_header_for("https://video.sibnet.ru/v/1/2.mp4", &[], "BILET123", "", "").is_none());
+        assert!(cookie_header_for("https://tau-video.xyz/api/video/a", &[], "BILET123", "", "").is_none());
         let with_cookie = vec![("Cookie".to_string(), "a=b".to_string())];
-        assert!(cookie_header_for("https://animecix.tv/secure/search/x", &with_cookie, "BILET123").is_none());
+        assert!(cookie_header_for("https://animecix.tv/secure/search/x", &with_cookie, "BILET123", "", "").is_none());
+
+        let with_session = cookie_header_for("https://animecix.tv/secure/history/get-titles", &[], "BILET123", "SID999", "XSRF1");
+        assert_eq!(with_session.as_deref(), Some("cf_clearance=BILET123; connect.sid=SID999; XSRF-TOKEN=XSRF1"));
     }
 }

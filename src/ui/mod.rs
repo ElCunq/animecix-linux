@@ -9,3 +9,4 @@ pub mod tools_menu;
 pub mod brand_icons;
 pub mod row_menu;
 pub mod play_quality_dialog;
+pub mod login_dialog;
