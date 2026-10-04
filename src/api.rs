@@ -2290,13 +2290,17 @@ impl Client {
         p
     }
 
-    pub fn load_state(&self) -> State {
+    fn load_raw_state(&self) -> State {
         let p = Self::state_path();
-        let mut st = std::fs::read_to_string(&p)
+        std::fs::read_to_string(&p)
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .map(|v| Self::migrate_state(&v))
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    pub fn load_state(&self) -> State {
+        let mut st = self.load_raw_state();
         let mut changed = false;
         for m in &mut st.marathon {
             if self.hydrate_title(&mut m.title) {
@@ -2633,6 +2637,18 @@ impl Client {
         }
         st.progress.remove(&format!("{title_id}:{season}:{episode}"));
         self.save_state(&st);
+    }
+
+    pub fn update_state<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut State) -> R,
+    {
+        static STATE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = STATE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.load_raw_state();
+        let ret = f(&mut st);
+        self.save_state(&st);
+        ret
     }
 
     pub fn save_state(&self, st: &State) {
@@ -3181,8 +3197,8 @@ impl Client {
         if !xsrf.is_empty() {
             s.xsrf_token = xsrf;
         }
-        if let Some(cf) = cf_clearance {
-            s.cf_clearance = cf.trim().to_string();
+        if !cf.is_empty() {
+            s.cf_clearance = cf;
         }
         s.user_profile = Some(user.clone());
         self.save_settings(&s);
@@ -3288,6 +3304,18 @@ impl Client {
             return Err("Oturum açılmamış".into());
         }
 
+        static SYNC_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if SYNC_IN_PROGRESS.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() {
+            return Ok(0);
+        }
+        struct SyncGuard;
+        impl Drop for SyncGuard {
+            fn drop(&mut self) {
+                SYNC_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _guard = SyncGuard;
+
         // Sayfa 0'ı çek (AnimeciX API sayfalama 0 tabanlıdır; 0 en son izlenenleri içerir)
         let resp = self.http.get(format!("{BASE}/secure/history/get-titles?page=0&query="))
             .header("Referer", "https://animecix.tv/")
@@ -3305,16 +3333,19 @@ impl Client {
 
         let max_pages = ((total_count + 9) / 10).min(35);
 
-        let mut st = self.load_state();
         let mut new_entries = Vec::new();
+        let mut new_prog = std::collections::HashMap::new();
 
         let process_batch = |titles_arr: &[serde_json::Value], st_prog: &mut std::collections::HashMap<String, (f64, f64)>, out: &mut Vec<HistoryEntry>| {
             for item in titles_arr {
                 if let Some(t_obj) = item.as_object() {
                     let id = t_obj.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let name = t_obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    if id == 0 || name.is_empty() {
+                    if id == 0 {
                         continue;
+                    }
+                    let mut name = t_obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if name.is_empty() {
+                        name = format!("Anime #{id}");
                     }
                     let poster = t_obj.get("poster").and_then(|v| v.as_str()).map(|s| s.to_string());
                     let title_type = t_obj.get("title_type").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -3333,6 +3364,12 @@ impl Client {
                         runtime: t_obj.get("runtime").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))),
                         release_date: t_obj.get("release_date").and_then(|v| v.as_str()).map(|s| s.to_string()),
                         ..Default::default()
+                    };
+
+                    let title = if title.name.starts_with("Anime #") || title.poster.is_none() {
+                        self.enrich_title(&title)
+                    } else {
+                        title
                     };
 
                     let vid_obj = t_obj.get("videos")
@@ -3430,7 +3467,7 @@ impl Client {
 
         // Sayfa 0'ı işle
         if let Some(titles) = val.get("data").and_then(|d| d.get("totalData")).and_then(|td| td.as_array()) {
-            process_batch(titles, &mut st.progress, &mut new_entries);
+            process_batch(titles, &mut new_prog, &mut new_entries);
         }
 
         // Kalan sayfaları (Sayfa 1..max_pages) çek ve işle
@@ -3449,7 +3486,7 @@ impl Client {
                 Some(arr) if !arr.is_empty() => arr,
                 _ => break,
             };
-            process_batch(titles, &mut st.progress, &mut new_entries);
+            process_batch(titles, &mut new_prog, &mut new_entries);
             if titles.len() < 10 {
                 break;
             }
@@ -3457,25 +3494,29 @@ impl Client {
 
         let count = new_entries.len();
 
-        // Mevcut geçmiş ile birleştir:
-        for entry in new_entries {
-            if let Some(pos) = st.history.iter().position(|h| h.title.id == entry.title.id) {
-                if entry.ts >= st.history[pos].ts {
-                    st.history[pos] = entry;
-                }
-            } else {
-                st.history.push(entry);
+        // Mevcut geçmiş ile atomik birleştir:
+        self.update_state(|st| {
+            for (k, v) in new_prog {
+                st.progress.insert(k, v);
             }
-        }
+            for entry in new_entries {
+                if let Some(pos) = st.history.iter().position(|h| h.title.id == entry.title.id) {
+                    if entry.ts >= st.history[pos].ts {
+                        st.history[pos] = entry;
+                    }
+                } else {
+                    st.history.push(entry);
+                }
+            }
 
-        // En son izlenenden ilk izlenene (azalan tarih) göre sırala!
-        st.history.sort_by(|a, b| b.ts.cmp(&a.ts));
+            // En son izlenenden ilk izlenene (azalan tarih) göre sırala!
+            st.history.sort_by(|a, b| b.ts.cmp(&a.ts));
 
-        if st.history.len() > 500 {
-            st.history.truncate(500);
-        }
+            if st.history.len() > 500 {
+                st.history.truncate(500);
+            }
+        });
 
-        self.save_state(&st);
         Ok(count)
     }
 }

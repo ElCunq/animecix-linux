@@ -3099,6 +3099,14 @@ impl App {
             let current_shared_t = current_shared.clone();
             let mut marked_ep: Option<(u64, u64)> = None;
             let mut last_cloud_report = std::time::Instant::now();
+            let (cloud_tx, cloud_rx) = std::sync::mpsc::channel::<(u64, u64, u64, f64)>();
+            let cp_worker = client.clone();
+            std::thread::spawn(move || {
+                while let Ok((t, s, e, p)) = cloud_rx.recv() {
+                    let _ = cp_worker.report_cloud_progress(t, s, e, p);
+                }
+            });
+
             glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
                 let rx = receiver.lock().unwrap();
                 let mut latest: Option<(f64, f64)> = None;
@@ -3120,10 +3128,7 @@ impl App {
                     if let Some((pos, dur)) = last {
                         client_prog.save_progress(tid, cur.1, cur.0, pos, dur);
                         if client_prog.is_logged_in() {
-                            let cp = client_prog.clone();
-                            std::thread::spawn(move || {
-                                let _ = cp.report_cloud_progress(tid, cur.1, cur.0, pos);
-                            });
+                            let _ = cloud_tx.send((tid, cur.1, cur.0, pos));
                         }
                     }
                     return glib::ControlFlow::Break;
@@ -3148,19 +3153,13 @@ impl App {
                     client_prog.save_progress(tid, cur.1, cur.0, pos, dur);
                     if client_prog.is_logged_in() && last_cloud_report.elapsed().as_secs() >= 15 {
                         last_cloud_report = std::time::Instant::now();
-                        let cp = client_prog.clone();
-                        std::thread::spawn(move || {
-                            let _ = cp.report_cloud_progress(tid, cur.1, cur.0, pos);
-                        });
+                        let _ = cloud_tx.send((tid, cur.1, cur.0, pos));
                     }
                     if api::Client::played_enough(pos, dur) && marked_ep != Some(cur) {
                         client_prog.save_watched(&api::Watched { title_id: tid, episode: cur.0, season: cur.1 }, "");
                         marked_ep = Some(cur);
                         if client_prog.is_logged_in() {
-                            let cp = client_prog.clone();
-                            std::thread::spawn(move || {
-                                let _ = cp.report_cloud_progress(tid, cur.1, cur.0, pos);
-                            });
+                            let _ = cloud_tx.send((tid, cur.1, cur.0, pos));
                         }
                     }
                 }
@@ -3209,93 +3208,115 @@ impl App {
                         .map(|o| o.status.success())
                         .unwrap_or(false);
 
-                    let mut cmd = if use_celluloid {
-                        let mut c = std::process::Command::new("celluloid");
-                        c.arg("--new-window");
-                        c
-                    } else {
-                        std::process::Command::new("mpv")
-                    };
+                    let build_cmd = |is_celluloid: bool| -> std::process::Command {
+                        let mut cmd = if is_celluloid {
+                            let mut c = std::process::Command::new("celluloid");
+                            c.arg("--new-window");
+                            c
+                        } else {
+                            std::process::Command::new("mpv")
+                        };
 
-                    let mut add_arg = |arg: &str| {
-                        if use_celluloid {
-                            if let Some(opt) = arg.strip_prefix("--") {
-                                cmd.arg(format!("--mpv-{opt}"));
+                        let mut add_arg = |arg: &str| {
+                            if is_celluloid {
+                                if let Some(opt) = arg.strip_prefix("--") {
+                                    cmd.arg(format!("--mpv-{opt}"));
+                                } else {
+                                    cmd.arg(arg);
+                                }
                             } else {
                                 cmd.arg(arg);
                             }
-                        } else {
-                            cmd.arg(arg);
-                        }
-                    };
+                        };
 
-                    add_arg("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-                    add_arg(&format!("--force-media-title={media_title_c}"));
-                    add_arg("--keep-open=yes");
-                    add_arg(&format!("--input-ipc-server={sock_path_c}"));
-                    if auto_fullscreen_c { add_arg("--fullscreen"); }
-                    // Atlama OSD'si alt-solda (şarkı ASS'i sağ-üstte; üst-üste binmez).
-                    add_arg("--osd-align-x=left");
-                    add_arg("--osd-align-y=bottom");
-                    add_arg("--osd-margin-x=30");
-                    add_arg("--osd-margin-y=30");
-                    add_arg(&format!("--input-conf={input_conf_path_c}"));
-                    if let Some(ass) = ass_path_c.as_deref() {
-                        add_arg(&format!("--sub-file={ass}"));
-                    }
-                    if let Some(fdir) = crate::font::ensure_fonts() {
-                        for a in crate::font::mpv_font_args(&fdir) {
+                        add_arg("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+                        add_arg(&format!("--force-media-title={media_title_c}"));
+                        add_arg("--keep-open=yes");
+                        add_arg(&format!("--input-ipc-server={sock_path_c}"));
+                        if auto_fullscreen_c { add_arg("--fullscreen"); }
+                        // Atlama OSD'si alt-solda (şarkı ASS'i sağ-üstte; üst-üste binmez).
+                        add_arg("--osd-align-x=left");
+                        add_arg("--osd-align-y=bottom");
+                        add_arg("--osd-margin-x=30");
+                        add_arg("--osd-margin-y=30");
+                        add_arg(&format!("--input-conf={input_conf_path_c}"));
+                        if let Some(ass) = ass_path_c.as_deref() {
+                            add_arg(&format!("--sub-file={ass}"));
+                        }
+                        if let Some(fdir) = crate::font::ensure_fonts() {
+                            for a in crate::font::mpv_font_args(&fdir) {
+                                add_arg(&a);
+                            }
+                        }
+                        if let Some(p) = saved_pos_c {
+                            add_arg(&format!("--start={p:.1}"));
+                        }
+                        add_arg("--cache=yes");
+                        add_arg("--demuxer-max-bytes=128MiB");
+                        add_arg("--demuxer-max-back-bytes=32MiB");
+                        add_arg("--demuxer-readahead-secs=120");
+                        add_arg("--cache-pause=yes");
+                        add_arg("--cache-pause-wait=3");
+                        add_arg("--cache-secs=120");
+                        add_arg("--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5");
+                        add_arg("--network-timeout=10");
+                        add_arg("--hwdec=auto-safe");
+                        add_arg("--ytdl-format=bestvideo[height<=1080]+bestaudio/best");
+                        for a in crate::api::upscale_mpv_args(&upscale_c, match upscale_c.as_str() {
+                            "hafif" => resolve_upscale_shader("Anime4K_Upscale_DTD_x2.glsl"),
+                            "ultra" => resolve_upscale_shader("Anime4K_Upscale_CNN_x2_UL.glsl"),
+                            "hafif_keskin" => resolve_upscale_shader("Anime4K_Upscale_DTD_x2.glsl"),
+                            _ => None,
+                        }.as_deref(), None) {
                             add_arg(&a);
                         }
-                    }
-                    if let Some(p) = saved_pos_c {
-                        add_arg(&format!("--start={p:.1}"));
-                    }
-                    add_arg("--cache=yes");
-                    add_arg("--demuxer-max-bytes=128MiB");
-                    add_arg("--demuxer-max-back-bytes=32MiB");
-                    add_arg("--demuxer-readahead-secs=120");
-                    add_arg("--cache-pause=yes");
-                    add_arg("--cache-pause-wait=3");
-                    add_arg("--cache-secs=120");
-                    add_arg("--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5");
-                    add_arg("--network-timeout=10");
-                    add_arg("--hwdec=auto-safe");
-                    add_arg("--ytdl-format=bestvideo[height<=1080]+bestaudio/best");
-                    for a in crate::api::upscale_mpv_args(&upscale_c, match upscale_c.as_str() {
-                        "hafif" => resolve_upscale_shader("Anime4K_Upscale_DTD_x2.glsl"),
-                        "ultra" => resolve_upscale_shader("Anime4K_Upscale_CNN_x2_UL.glsl"),
-                        "hafif_keskin" => resolve_upscale_shader("Anime4K_Upscale_DTD_x2.glsl"),
-                        _ => None,
-                    }.as_deref(), None) {
-                        add_arg(&a);
-                    }
-                    if url.contains("video.sibnet.ru/v/") {
-                        let vid = url
-                            .split("/v/")
-                            .nth(1)
-                            .and_then(|s| s.split('/').nth(1))
-                            .map(|s| s.trim_end_matches(".mp4"))
-                            .unwrap_or("");
-                        let referer = if vid.is_empty() {
-                            "https://video.sibnet.ru/".to_string()
-                        } else {
-                            format!("https://video.sibnet.ru/shell.php?videoid={}", vid)
-                        };
-                        add_arg(&format!(
-                            "--http-header-fields=Referer: {}\nAccept: */*",
-                            referer
-                        ));
-                    }
-                    cmd.arg(url.as_str());
-
-                    let player_name = if use_celluloid { "Celluloid" } else { "mpv" };
-                    eprintln!("[SUP] {} spawn deneniyor (ep={}, kaynak={}, url={:.80})", player_name, episode, i, url);
-                    let child = match cmd.spawn() {
-                        Ok(c) => c,
-                        Err(e) => { eprintln!("[SUP] HATA {} başlatılamadı (ep={}, kaynak={}): {}", player_name, episode, i, e); continue; }
+                        if url.contains("video.sibnet.ru/v/") {
+                            let vid = url
+                                .split("/v/")
+                                .nth(1)
+                                .and_then(|s| s.split('/').nth(1))
+                                .map(|s| s.trim_end_matches(".mp4"))
+                                .unwrap_or("");
+                            let referer = if vid.is_empty() {
+                                "https://video.sibnet.ru/".to_string()
+                            } else {
+                                format!("https://video.sibnet.ru/shell.php?videoid={}", vid)
+                            };
+                            add_arg(&format!(
+                                "--http-header-fields=Referer: {}\nAccept: */*",
+                                referer
+                            ));
+                        }
+                        cmd.arg(url.as_str());
+                        cmd
                     };
-                    eprintln!("[SUP] {} spawn edildi (ep={}, kaynak={})", player_name, episode, i);
+
+                    let child = if use_celluloid {
+                        eprintln!("[SUP] Celluloid spawn deneniyor (ep={}, kaynak={}, url={:.80})", episode, i, url);
+                        match build_cmd(true).spawn() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("[SUP] Celluloid başlatılamadı ({}), mpv fallback deneniyor...", e);
+                                match build_cmd(false).spawn() {
+                                    Ok(c) => c,
+                                    Err(e_mpv) => {
+                                        eprintln!("[SUP] HATA mpv de başlatılamadı: {}", e_mpv);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        eprintln!("[SUP] mpv spawn deneniyor (ep={}, kaynak={}, url={:.80})", episode, i, url);
+                        match build_cmd(false).spawn() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("[SUP] HATA mpv başlatılamadı: {}", e);
+                                continue;
+                            }
+                        }
+                    };
+                    eprintln!("[SUP] Oynatıcı spawn edildi (ep={}, kaynak={})", episode, i);
                     *mpv_child_c.lock().unwrap() = Some(child);
 
                     let start = std::time::Instant::now();
