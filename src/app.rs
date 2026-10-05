@@ -65,6 +65,7 @@ pub enum Msg {
         rest: Vec<api::FansubInfo>,
         quals: Result<Vec<crate::play_quality::PlayQuality>, String>,
     },
+    NextEpResolved(Title, Option<Episode>),
 }
 
 pub struct App {
@@ -2513,6 +2514,27 @@ impl App {
                     self.toast.add_toast(t);
                 }
             }
+            Msg::NextEpResolved(title, next_ep) => {
+                self.busy(false);
+                match next_ep {
+                    Some(ep) => {
+                        let t = adw::Toast::new(&format!(
+                            "▶ Sonraki Bölüm: S{:02}E{:02} - {}",
+                            ep.season,
+                            ep.episode,
+                            glib::markup_escape_text(&ep.name)
+                        ));
+                        t.set_timeout(3);
+                        self.toast.add_toast(t);
+                        self.play(&title, &ep);
+                    }
+                    None => {
+                        let t = adw::Toast::new("🎉 Tebrikler! Tüm bölümleri tamamladınız.");
+                        t.set_timeout(4);
+                        self.toast.add_toast(t);
+                    }
+                }
+            }
         }
     }
 
@@ -2522,6 +2544,19 @@ impl App {
             let enriched = c.enrich_title(&title);
             let res = c.episodes(&enriched);
             move || Msg::Eps(enriched.clone(), res)
+        });
+    }
+
+    fn play_next_episode(&self, title: &Title, cur_season: u64, cur_episode: u64) {
+        let title_c = title.clone();
+        self.busy(true);
+        let toast = adw::Toast::new("⏭ Sonraki bölüm aranıyor…");
+        toast.set_timeout(2);
+        self.toast.add_toast(toast);
+        self.spawn(move |c| {
+            let eps = c.episodes(&title_c).unwrap_or_default();
+            let next = api::Client::find_next_episode(&eps, cur_season, cur_episode);
+            move || Msg::NextEpResolved(title_c, next)
         });
     }
 
@@ -2891,6 +2926,8 @@ impl App {
 
         let sock_path = format!("/tmp/animecix-mpv-{tid}-{season}-{episode}.sock");
         let _ = std::fs::remove_file(&sock_path);
+        let next_flag_path = format!("/tmp/animecix-next-{tid}-{season}-{episode}.flag");
+        let _ = std::fs::remove_file(&next_flag_path);
 
         let auto_fullscreen = self.settings.borrow().auto_fullscreen;
         let upscale = self.settings.borrow().upscale.clone();
@@ -2908,6 +2945,9 @@ impl App {
         let song_url = plan.as_ref().and_then(|p| p.song_url.clone());
         if let Some(url) = &song_url {
             input_conf_content.push_str(&crate::music::music_keybind_line(url));
+        }
+        if title.title_type.as_deref() != Some("movie") {
+            input_conf_content.push_str(&crate::skip::next_keybind_lines(&next_flag_path));
         }
         let _ = std::fs::write(&input_conf_path, input_conf_content);
 
@@ -3046,10 +3086,14 @@ impl App {
             let sock_c = sock_path.clone();
             let skip_c = skip_shared.clone();
             let show_intro_hint_c = show_intro_hint;
+            let auto_next_c = self.settings.borrow().auto_next_episode && title.title_type.as_deref() != Some("movie");
+            let next_flag_poll = next_flag_path.clone();
             let (sender, receiver) = std::sync::mpsc::channel::<(f64, f64)>();
             std::thread::spawn(move || {
                 let mut op_prompted = false;
                 let mut ed_prompted = false;
+                let mut auto_next_triggered = false;
+                let mut eof_timer: Option<std::time::Instant> = None;
 
                 while alive.load(std::sync::atomic::Ordering::Relaxed)
                     && !std::path::Path::new(&sock_poll).exists()
@@ -3082,6 +3126,27 @@ impl App {
                                 }
                             }
                         }
+
+                        if auto_next_c && !auto_next_triggered && dur > 60.0 {
+                            let eof = crate::player::query_mpv_prop(&sock_c, "eof-reached") == Some(1.0);
+                            if eof || pos >= (dur - 1.5) {
+                                auto_next_triggered = true;
+                                let msg = "⏭ Bölüm Bitti! 3 saniye içinde sonraki bölüm açılıyor... (İptal için 'q')";
+                                for cmd in crate::skip::skip_osd_cmds(msg, 3500) {
+                                    crate::player::send_mpv_cmd_retry(&sock_c, &cmd, 1);
+                                }
+                                eof_timer = Some(std::time::Instant::now());
+                            }
+                        }
+
+                        if let Some(t) = eof_timer {
+                            if t.elapsed().as_millis() >= 3000 {
+                                let _ = std::fs::File::create(&next_flag_poll);
+                                let _ = crate::player::send_mpv_cmd(&sock_c, "{\"command\":[\"quit\"]}\n");
+                                break;
+                            }
+                        }
+
                         if sender.send((pos, dur)).is_err() { break; }
                     } else {
                         if !alive.load(std::sync::atomic::Ordering::Relaxed) { break; }
@@ -3097,6 +3162,9 @@ impl App {
             let client_prog = client.clone();
             let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
             let current_shared_t = current_shared.clone();
+            let this_next = self.clone_ref();
+            let title_next = title.clone();
+            let next_flag_c = next_flag_path.clone();
             let mut marked_ep: Option<(u64, u64)> = None;
             let mut last_cloud_report = std::time::Instant::now();
             let (cloud_tx, cloud_rx) = std::sync::mpsc::channel::<(u64, u64, u64, f64)>();
@@ -3130,6 +3198,17 @@ impl App {
                         if client_prog.is_logged_in() {
                             let _ = cloud_tx.send((tid, cur.1, cur.0, pos));
                         }
+                    }
+                    let should_play_next = std::path::Path::new(&next_flag_c).exists();
+                    let _ = std::fs::remove_file(&next_flag_c);
+
+                    if should_play_next {
+                        client_prog.save_watched(&api::Watched { title_id: tid, episode: cur.0, season: cur.1 }, "");
+                        let this_n = this_next.clone();
+                        let title_n = title_next.clone();
+                        glib::idle_add_local_once(move || {
+                            this_n.play_next_episode(&title_n, cur.1, cur.0);
+                        });
                     }
                     return glib::ControlFlow::Break;
                 }

@@ -401,6 +401,9 @@ pub struct Settings {
     /// Oturum açmış AnimeciX kullanıcı profili
     #[serde(default)]
     pub user_profile: Option<UserProfile>,
+    /// Bölüm bitince veya kısayolla sonraki bölüme otomatik geçiş
+    #[serde(default = "default_true")]
+    pub auto_next_episode: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -819,6 +822,7 @@ impl Default for Settings {
             connect_sid: String::new(),
             xsrf_token: String::new(),
             user_profile: None,
+            auto_next_episode: default_true(),
         }
     }
 }
@@ -1290,6 +1294,15 @@ impl Client {
             return self.movie_episodes(t.id);
         }
         Ok(all)
+    }
+
+    /// Mevcut sezon ve bölüme göre bir sonraki bölümü bulur.
+    /// Bölümler sıralı kontrol edilir; sezon bittiğinde sonraki sezonun ilk bölümünden devam eder.
+    pub fn find_next_episode(eps: &[Episode], cur_season: u64, cur_episode: u64) -> Option<Episode> {
+        let mut sorted = eps.to_vec();
+        sorted.sort_by_key(|e| (e.season, e.episode));
+        sorted.dedup_by_key(|e| (e.season, e.episode));
+        sorted.into_iter().find(|e| (e.season, e.episode) > (cur_season, cur_episode))
     }
 
     fn movie_videos(&self, title_id: u64) -> Result<serde_json::Value, String> {
@@ -3739,6 +3752,43 @@ mod tests {
             season_count: seasons,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_find_next_episode() {
+        let eps = vec![
+            Episode { season: 1, episode: 1, name: "S1E1".into() },
+            Episode { season: 1, episode: 2, name: "S1E2".into() },
+            Episode { season: 2, episode: 1, name: "S2E1".into() },
+            Episode { season: 2, episode: 2, name: "S2E2".into() },
+        ];
+
+        // Aynı sezonda sonraki bölüm
+        let n1 = Client::find_next_episode(&eps, 1, 1).expect("S1E2 bulunmalı");
+        assert_eq!(n1.season, 1);
+        assert_eq!(n1.episode, 2);
+
+        // Sezon bittiğinde sonraki sezonun 1. bölümü
+        let n2 = Client::find_next_episode(&eps, 1, 2).expect("S2E1 bulunmalı");
+        assert_eq!(n2.season, 2);
+        assert_eq!(n2.episode, 1);
+
+        // Sonraki sezonda ilerleme
+        let n3 = Client::find_next_episode(&eps, 2, 1).expect("S2E2 bulunmalı");
+        assert_eq!(n3.season, 2);
+        assert_eq!(n3.episode, 2);
+
+        // Serinin son bölümü bittiğinde None
+        assert!(Client::find_next_episode(&eps, 2, 2).is_none());
+
+        // Sırasız listede de doğru sıralama
+        let unsorted = vec![
+            Episode { season: 2, episode: 1, name: "S2E1".into() },
+            Episode { season: 1, episode: 1, name: "S1E1".into() },
+        ];
+        let n_unsorted = Client::find_next_episode(&unsorted, 1, 1).expect("S2E1 bulunmalı");
+        assert_eq!(n_unsorted.season, 2);
+        assert_eq!(n_unsorted.episode, 1);
     }
 
     #[test]

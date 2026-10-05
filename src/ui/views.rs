@@ -782,6 +782,13 @@ impl SettingsView {
             settings.play_ask_quality,
         );
         player_group.add(&play_q_row);
+
+        let (next_ep_row, next_ep_sw) = crate::ui::components::switch_row(
+            "Otomatik Sonraki Bölüm",
+            "Bölüm bittiğinde veya '>' / 'N' tuşuna basıldığında sonraki bölüme (sezon bittiyse sonraki sezona) geçer",
+            settings.auto_next_episode,
+        );
+        player_group.add(&next_ep_row);
         root.append(&player_group);
 
         let perf_group = adw::PreferencesGroup::new();
@@ -949,6 +956,7 @@ impl SettingsView {
             let scale_r = scale_row.clone();
             let theme_r = theme_row.clone();
             let fs_r = fs_sw.clone();
+            let ne_r = next_ep_sw.clone();
             let ih_r = intro_hint_sw.clone();
             let mh_r = music_hint_sw.clone();
             let pq_r = play_q_sw.clone();
@@ -993,6 +1001,7 @@ impl SettingsView {
                     .map(|(id, _)| id.to_string())
                     .unwrap_or_else(|| crate::theme::DEFAULT_THEME.to_string());
                 updated.auto_fullscreen = fs_r.is_active();
+                updated.auto_next_episode = ne_r.is_active();
                 updated.show_intro_hint = ih_r.is_active();
                 updated.show_music_hint = mh_r.is_active();
                 updated.play_ask_quality = pq_r.is_active();
