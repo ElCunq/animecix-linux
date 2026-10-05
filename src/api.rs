@@ -935,7 +935,9 @@ impl Client {
         let s = c.load_settings();
         c.http.set_cf_clearance(&s.cf_clearance);
         c.http.set_connect_sid(&s.connect_sid);
-        c.http.set_xsrf_token(&s.xsrf_token);
+        if s.xsrf_token.len() >= 10 {
+            c.http.set_xsrf_token(&s.xsrf_token);
+        }
         c.remember_cover_quality(&s.cover_quality);
         c
     }
@@ -3178,6 +3180,7 @@ impl Client {
             return Err("Cloudflare engeline takıldı. Güncel bir cf_clearance bileti girmeniz gerekebilir.".into());
         }
 
+        let fresh_xsrf = resp.set_cookie_val("XSRF-TOKEN");
         let root: serde_json::Value = resp.json().map_err(|e| format!("Yanıt okunamadı: {e}"))?;
         let data_b64 = root.get("data").and_then(|d| d.as_str()).ok_or_else(|| "bootstrap verisi yok".to_string())?;
 
@@ -3194,7 +3197,11 @@ impl Client {
 
         let mut s = self.load_settings();
         s.connect_sid = sid;
-        if !xsrf.is_empty() {
+        let fresh_xsrf = fresh_xsrf.unwrap_or_else(|| self.http.xsrf_token());
+        if !fresh_xsrf.is_empty() {
+            s.xsrf_token = fresh_xsrf.clone();
+            self.http.set_xsrf_token(&fresh_xsrf);
+        } else if !xsrf.is_empty() {
             s.xsrf_token = xsrf;
         }
         if !cf.is_empty() {
@@ -3264,10 +3271,13 @@ impl Client {
             .json(&body)
             .send()
             .map_err(|e| format!("İlerleme bildirilemedi: {e}"))?;
-        if (200..300).contains(&resp.status()) {
+        let status = resp.status();
+        if (200..300).contains(&status) {
             Ok(())
         } else {
-            Err(format!("Bulut ilerleme hatası: HTTP {}", resp.status()))
+            let txt = resp.text().unwrap_or_default();
+            eprintln!("[CLOUD-PROG] report-current-time HTTP {status}: {txt}");
+            Err(format!("Bulut ilerleme hatası: HTTP {status}"))
         }
     }
 
@@ -3276,6 +3286,11 @@ impl Client {
         if !self.is_logged_in() {
             return;
         }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let ep_name = format!("{episode_num}. Bölüm");
         let body = serde_json::json!({
             "id": title.id,
             "name": title.name,
@@ -3283,19 +3298,45 @@ impl Client {
             "title_type": title.title_type,
             "year": title.year,
             "season_count": title.season_count,
+            "date": now_ms,
             "season": {
                 "number": season_num,
                 "season_number": season_num,
                 "episodes": [{
                     "episode_number": episode_num,
                     "season_number": season_num,
+                    "name": ep_name,
                 }]
-            }
+            },
+            "episodes": [{
+                "id": 0,
+                "title_id": title.id,
+                "episode_number": episode_num,
+                "season_number": season_num,
+                "name": ep_name,
+            }],
+            "videos": [{
+                "title_id": title.id,
+                "episode_num": episode_num,
+                "season_num": season_num,
+                "name": ep_name,
+            }]
         });
-        let _ = self.http.post(format!("{BASE}/secure/history/put-title"))
+        match self.http.post(format!("{BASE}/secure/history/put-title"))
             .header("Content-Type", "application/json")
             .json(&body)
-            .send();
+            .send()
+        {
+            Ok(resp) if (200..300).contains(&resp.status()) => {
+                eprintln!("[CLOUD-PUT] Başarılı: {} S{:02}E{:02}", title.name, season_num, episode_num);
+            }
+            Ok(resp) => {
+                eprintln!("[CLOUD-PUT] Hata HTTP {}: {}", resp.status(), resp.text().unwrap_or_default());
+            }
+            Err(e) => {
+                eprintln!("[CLOUD-PUT] Ağ hatası: {e}");
+            }
+        }
     }
 
     /// Buluttaki izleme geçmişini yerel state ile eşitler (fetch & merge).
@@ -3331,7 +3372,14 @@ impl Client {
             .and_then(|c| c.as_u64())
             .unwrap_or(10);
 
-        let max_pages = ((total_count + 9) / 10).min(35);
+        let max_pages = ((total_count + 9) / 10).min(5);
+
+        let current_state = self.load_state();
+        let local_history_map: std::collections::HashMap<u64, HistoryEntry> = current_state
+            .history
+            .into_iter()
+            .map(|h| (h.title.id, h))
+            .collect();
 
         let mut new_entries = Vec::new();
         let mut new_prog = std::collections::HashMap::new();
@@ -3421,16 +3469,52 @@ impl Client {
                         .or(s_num_from_obj)
                         .unwrap_or(1);
 
-                    let ep_num = vid_ep
-                        .or(dep_ep)
-                        .or(sep_ep)
-                        .unwrap_or(1);
+                    let mut ep_num = vid_ep.or(dep_ep);
+                    let is_stub_season_ep = season_ep_obj.is_some()
+                        && title.episode_count.unwrap_or(0) > 2
+                        && sep_ep.unwrap_or(0) <= 2;
+
+                    let mut found_secs = 0.0;
+                    if ep_num.is_none() {
+                        let hint = local_history_map.get(&id)
+                            .map(|h| h.episode.episode)
+                            .unwrap_or_else(|| if is_stub_season_ep { 1 } else { sep_ep.unwrap_or(1) });
+
+                        let mut best_ep = hint;
+                        let mut best_secs = self.get_cloud_progress(id, season_num, best_ep).unwrap_or(0.0);
+                        if best_secs == 0.0 && hint > 1 {
+                            if let Some(s) = self.get_cloud_progress(id, season_num, 1) {
+                                if s > 0.0 { best_ep = 1; best_secs = s; }
+                            }
+                        }
+
+                        // Web'de daha ileri bölüm izlenmiş mi diye ileriye doğru kontrol et
+                        let mut probe = best_ep + 1;
+                        let mut misses = 0;
+                        while misses < 2 && probe <= best_ep + 15 {
+                            if let Some(s) = self.get_cloud_progress(id, season_num, probe) {
+                                if s > 0.0 {
+                                    best_ep = probe;
+                                    best_secs = s;
+                                    misses = 0;
+                                } else {
+                                    misses += 1;
+                                }
+                            } else {
+                                misses += 1;
+                            }
+                            probe += 1;
+                        }
+                        ep_num = Some(best_ep);
+                        found_secs = best_secs;
+                    }
+                    let ep_num = ep_num.unwrap_or(1);
 
                     let is_movie = title_type.as_deref() == Some("movie") || (season_num == 0 && ep_num == 0);
 
                     let ep_name = vid_name
                         .or(dep_name)
-                        .or(sep_name)
+                        .or(if is_stub_season_ep { None } else { sep_name })
                         .unwrap_or_else(|| if is_movie { "Film".to_string() } else { format!("{ep_num}. Bölüm") });
 
                     let episode = Episode {
@@ -3439,11 +3523,22 @@ impl Client {
                         name: ep_name,
                     };
 
-                    let cur_time_ms = vid_obj.and_then(|v| v.get("currentTime")).and_then(|v| v.as_f64())
-                        .or_else(|| direct_ep_obj.and_then(|e| e.get("currentTime")).and_then(|v| v.as_f64()))
-                        .or_else(|| season_ep_obj.and_then(|e| e.get("currentTime")).and_then(|v| v.as_f64()))
-                        .or_else(|| t_obj.get("currentTime").and_then(|v| v.as_f64()))
-                        .unwrap_or(0.0);
+                    let cur_time_ms = if found_secs > 0.0 {
+                        found_secs * 1000.0
+                    } else {
+                        let c = vid_obj.and_then(|v| v.get("currentTime")).and_then(|v| v.as_f64())
+                            .or_else(|| direct_ep_obj.and_then(|e| e.get("currentTime")).and_then(|v| v.as_f64()))
+                            .or_else(|| if is_stub_season_ep { None } else { season_ep_obj.and_then(|e| e.get("currentTime")).and_then(|v| v.as_f64()) })
+                            .or_else(|| t_obj.get("currentTime").and_then(|v| v.as_f64()))
+                            .unwrap_or(0.0);
+                        if c > 0.0 {
+                            c
+                        } else if let Some(s) = self.get_cloud_progress(id, season_num, ep_num) {
+                            s * 1000.0
+                        } else {
+                            0.0
+                        }
+                    };
 
                     if cur_time_ms > 0.0 {
                         let key = format!("{id}:{season_num}:{ep_num}");
@@ -3472,6 +3567,7 @@ impl Client {
 
         // Kalan sayfaları (Sayfa 1..max_pages) çek ve işle
         for page in 1..max_pages {
+            std::thread::sleep(std::time::Duration::from_millis(100));
             let page_resp = match self.http.get(format!("{BASE}/secure/history/get-titles?page={page}&query="))
                 .header("Referer", "https://animecix.tv/")
                 .send() {
@@ -3501,7 +3597,10 @@ impl Client {
             }
             for entry in new_entries {
                 if let Some(pos) = st.history.iter().position(|h| h.title.id == entry.title.id) {
-                    if entry.ts >= st.history[pos].ts {
+                    let existing = &st.history[pos];
+                    if entry.episode.episode > existing.episode.episode
+                        || (entry.episode.episode == existing.episode.episode && entry.ts >= existing.ts)
+                    {
                         st.history[pos] = entry;
                     }
                 } else {
@@ -3516,6 +3615,15 @@ impl Client {
                 st.history.truncate(500);
             }
         });
+
+        let current_xsrf = self.http.xsrf_token();
+        if !current_xsrf.is_empty() {
+            let mut s = self.load_settings();
+            if s.xsrf_token != current_xsrf {
+                s.xsrf_token = current_xsrf;
+                self.save_settings(&s);
+            }
+        }
 
         Ok(count)
     }
@@ -4788,6 +4896,8 @@ mod fansub_tests {
             for (i, h) in st.history.iter().take(10).enumerate() {
                 println!("{}: {} -> S:{} B:{} (ts={})", i, h.title.name, h.episode.season, h.episode.episode, h.ts);
             }
+            let rep_res = c.report_cloud_progress(258, 1, 133, 1254.277);
+            println!("Report cloud progress result: {:?}", rep_res);
         }
     }
 }

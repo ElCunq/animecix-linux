@@ -228,6 +228,22 @@ fn exec_on(
     })
 }
 
+fn extract_cookie_val(headers: &[(String, String)], cookie_name: &str) -> Option<String> {
+    let prefix = format!("{cookie_name}=");
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("set-cookie") {
+            if let Some(pos) = v.find(&prefix) {
+                let rest = &v[pos + prefix.len()..];
+                let val = rest.split(';').next().unwrap_or("").trim();
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn exec_cascade(rt: &tokio::runtime::Runtime, inner: &Inner, spec: &Spec) -> Result<RawResp, String> {
     let order: [(u8, &wreq::Client); 2] = if inner.last_good.load(Ordering::Relaxed) == 1 && inner.fallback.is_some() {
         [(1, inner.fallback.as_ref().unwrap()), (0, &inner.primary)]
@@ -239,12 +255,69 @@ fn exec_cascade(rt: &tokio::runtime::Runtime, inner: &Inner, spec: &Spec) -> Res
     for (idx, client) in order.iter().take(if inner.fallback.is_some() { 2 } else { 1 }) {
         let clearance = inner.cf_clearance.lock().map(|g| g.clone()).unwrap_or_default();
         let connect_sid = inner.connect_sid.lock().map(|g| g.clone()).unwrap_or_default();
-        let xsrf_token = inner.xsrf_token.lock().map(|g| g.clone()).unwrap_or_default();
-        let res = exec_on(rt, client, &spec, &clearance, &connect_sid, &xsrf_token);
+        let mut xsrf_token = inner.xsrf_token.lock().map(|g| g.clone()).unwrap_or_default();
+
+        if xsrf_token.len() < 10 && spec.url.contains("animecix.tv") && matches!(spec.method, Method::Post) {
+            let bs_spec = Spec {
+                method: Method::Get,
+                url: "https://animecix.tv/secure/bootstrap-data".to_string(),
+                headers: Vec::new(),
+                query: None,
+                json_body: None,
+                timeout_secs: Some(5),
+            };
+            if let Ok(bs_resp) = exec_on(rt, client, &bs_spec, &clearance, &connect_sid, "") {
+                if let Some(tok) = extract_cookie_val(&bs_resp.headers, "XSRF-TOKEN") {
+                    if let Ok(mut g) = inner.xsrf_token.lock() {
+                        *g = tok.clone();
+                    }
+                    xsrf_token = tok;
+                }
+            }
+        }
+
+        let res = exec_on(rt, client, spec, &clearance, &connect_sid, &xsrf_token);
         match &res {
             Ok(r) if r.status != 403 => {
                 inner.last_good.store(*idx, Ordering::Relaxed);
+                if let Some(tok) = extract_cookie_val(&r.headers, "XSRF-TOKEN") {
+                    if let Ok(mut g) = inner.xsrf_token.lock() {
+                        *g = tok;
+                    }
+                }
+                if let Some(sid) = extract_cookie_val(&r.headers, "connect.sid") {
+                    if let Ok(mut g) = inner.connect_sid.lock() {
+                        *g = sid;
+                    }
+                }
                 return res;
+            }
+            Ok(r) if r.status == 403 => {
+                if spec.url.contains("animecix.tv") && matches!(spec.method, Method::Post) {
+                    let bs_spec = Spec {
+                        method: Method::Get,
+                        url: "https://animecix.tv/secure/bootstrap-data".to_string(),
+                        headers: Vec::new(),
+                        query: None,
+                        json_body: None,
+                        timeout_secs: Some(5),
+                    };
+                    if let Ok(bs_resp) = exec_on(rt, client, &bs_spec, &clearance, &connect_sid, "") {
+                        if let Some(tok) = extract_cookie_val(&bs_resp.headers, "XSRF-TOKEN") {
+                            if let Ok(mut g) = inner.xsrf_token.lock() {
+                                *g = tok.clone();
+                            }
+                            let retry_res = exec_on(rt, client, spec, &clearance, &connect_sid, &tok);
+                            if let Ok(ref rr) = retry_res {
+                                if rr.status != 403 {
+                                    inner.last_good.store(*idx, Ordering::Relaxed);
+                                    return retry_res;
+                                }
+                            }
+                        }
+                    }
+                }
+                last = Some(res);
             }
             _ => last = Some(res),
         }
