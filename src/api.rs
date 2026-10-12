@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 const BASE: &str = "https://animecix.tv";
 const TAU: &str = "https://tau-video.xyz";
+pub const GUEST_TOKEN: &str = "1|E6RGQh3V6qK3fhsansMnCBgUIeTpGTkYcmrQluHn";
 const API_TTL_SECS: u64 = 3 * 3600;
 const IMG_TTL_SECS: u64 = 7 * 24 * 3600;
 
@@ -1200,6 +1201,8 @@ impl Client {
         c.http.set_connect_sid(&s.connect_sid);
         if !s.api_token.is_empty() {
             c.http.set_api_token(&s.api_token);
+        } else {
+            c.http.set_api_token(GUEST_TOKEN);
         }
         if s.xsrf_token.len() >= 10 {
             c.http.set_xsrf_token(&s.xsrf_token);
@@ -3574,29 +3577,54 @@ fn sign_query(query: &str) -> Result<String, String> {
             "password": password,
             "token_name": device_name
         });
+        eprintln!("[AUTH-API] POST /api/v1/auth/login email={} device={}", email.trim(), device_name);
         let resp = self.http.post(format!("{BASE}/api/v1/auth/login"))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .json(&body)
             .send()
-            .map_err(|e| format!("Giriş isteği başarısız: {e}"))?;
+            .map_err(|e| {
+                eprintln!("[AUTH-API] İstek hatası: {e}");
+                format!("Giriş isteği başarısız: {e}")
+            })?;
 
         let status = resp.status();
+        let raw_body = resp.text().unwrap_or_default();
+        eprintln!("[AUTH-API] Yanıt HTTP {status}: {raw_body}");
+
         if status == 401 || status == 403 {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw_body) {
+                if let Some(err) = parsed.get("error").and_then(|v| v.as_str()) {
+                    return Err(err.to_string());
+                }
+                if let Some(msg) = parsed.get("message").and_then(|v| v.as_str()) {
+                    return Err(msg.to_string());
+                }
+            }
             return Err("E-posta veya şifre hatalı.".into());
         }
         if !(200..300).contains(&status) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw_body) {
+                if let Some(err) = parsed.get("error").and_then(|v| v.as_str()) {
+                    return Err(err.to_string());
+                }
+                if let Some(msg) = parsed.get("message").and_then(|v| v.as_str()) {
+                    return Err(msg.to_string());
+                }
+            }
             return Err(format!("Giriş başarısız (HTTP {status})"));
         }
 
-        let val: serde_json::Value = resp.json().map_err(|e| format!("Yanıt JSON olarak okunamadı: {e}"))?;
+        let val: serde_json::Value = serde_json::from_str(&raw_body)
+            .map_err(|e| format!("Yanıt JSON olarak okunamadı: {e}"))?;
 
-        let token = val.get("accessToken")
+        let token = val.get("access_token")
+            .or_else(|| val.get("accessToken"))
             .or_else(|| val.get("token"))
-            .or_else(|| val.get("user").and_then(|u| u.get("accessToken").or_else(|| u.get("token"))))
-            .or_else(|| val.get("data").and_then(|d| d.get("accessToken").or_else(|| d.get("token"))))
+            .or_else(|| val.get("user").and_then(|u| u.get("access_token").or_else(|| u.get("accessToken")).or_else(|| u.get("token"))))
+            .or_else(|| val.get("data").and_then(|d| d.get("access_token").or_else(|| d.get("accessToken")).or_else(|| d.get("token"))))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "Giriş yanıtında erişim tokeni (accessToken) bulunamadı".to_string())?
+            .ok_or_else(|| "Giriş yanıtında erişim tokeni (access_token) bulunamadı".to_string())?
             .to_string();
 
         let user_val = val.get("user")
@@ -3736,7 +3764,7 @@ fn sign_query(query: &str) -> Result<String, String> {
         s.xsrf_token.clear();
         s.user_profile = None;
         self.save_settings(&s);
-        self.http.set_api_token("");
+        self.http.set_api_token(GUEST_TOKEN);
         self.http.set_connect_sid("");
         self.http.set_xsrf_token("");
     }

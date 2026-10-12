@@ -49,6 +49,21 @@ fn main() {
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }
+
+    // Gtk-CRITICAL ve gürültülü css section loglarını filtrele
+    glib::log_set_default_handler(|log_domain, log_level, message| {
+        if let Some(domain) = log_domain {
+            if (domain == "Gtk" || domain == "Gdk" || domain == "GLib-GObject") 
+                && (log_level == glib::LogLevel::Critical || log_level == glib::LogLevel::Warning) 
+            {
+                // Bilinen zararsız GTK/CSS uyarılarını ve assertion'larını sessize al
+                if message.contains("gtk_css_section") || message.contains("assertion") {
+                    return;
+                }
+            }
+        }
+        glib::log_default_handler(log_domain, log_level, Some(message));
+    });
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.iter().any(|a| a == "--check-shaders") {
         return cmd_check_shaders();
