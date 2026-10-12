@@ -3568,7 +3568,7 @@ fn sign_query(query: &str) -> Result<String, String> {
 
     /// E-posta ve şifre ile AnimeciX Mobil API üzerinden doğrudan giriş yapar.
     pub fn login(&self, email: &str, password: &str) -> Result<UserProfile, String> {
-        let device_name = "Samsung Galaxy S23 Ultra (SM-S918B)";
+        let device_name = "SM-S918B";
         let body = serde_json::json!({
             "email": email.trim(),
             "password": password,
