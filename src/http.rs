@@ -36,6 +36,7 @@ struct Inner {
     cf_clearance: Mutex<String>,
     connect_sid: Mutex<String>,
     xsrf_token: Mutex<String>,
+    api_token: Mutex<String>,
 }
 
 #[derive(Clone)]
@@ -164,6 +165,7 @@ fn exec_on(
     clearance: &str,
     connect_sid: &str,
     xsrf_token: &str,
+    api_token: &str,
 ) -> Result<RawResp, String> {
     let mut url = spec.url.clone();
     if let Some(q) = &spec.query {
@@ -176,17 +178,31 @@ fn exec_on(
             url.push_str(&qs.join("&"));
         }
     }
-    // Başlıklar özgün host'a göre.
-    let mut extra: Vec<(String, String)> = browser_headers_for(&url, &spec.headers);
-    if let Some(c) = cookie_header_for(&url, &spec.headers, clearance, connect_sid, xsrf_token) {
-        extra.push(("Cookie".to_string(), c));
-    }
-    let is_animecix = url.contains("animecix.tv");
-    if is_animecix && !xsrf_token.is_empty() && !spec.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-xsrf-token")) {
-        extra.push(("X-XSRF-TOKEN".to_string(), xsrf_token.to_string()));
-    }
-    if is_animecix && matches!(spec.method, Method::Post) && !spec.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("origin")) {
-        extra.push(("Origin".to_string(), "https://animecix.tv".to_string()));
+    // Başlıklar özgün host'a ve mobil API'ye göre.
+    let is_mobile_api = url.contains("/api/v1/");
+    let mut extra: Vec<(String, String)> = if is_mobile_api {
+        let mut h = Vec::new();
+        h.push(("User-Agent".to_string(), "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.141 Safari/537.36 ANIMECIXMOBILE".to_string()));
+        h.push(("Accept".to_string(), "application/json".to_string()));
+        if !api_token.is_empty() {
+            h.push(("Authorization".to_string(), format!("Bearer {api_token}")));
+        }
+        h
+    } else {
+        browser_headers_for(&url, &spec.headers)
+    };
+
+    if !is_mobile_api {
+        if let Some(c) = cookie_header_for(&url, &spec.headers, clearance, connect_sid, xsrf_token) {
+            extra.push(("Cookie".to_string(), c));
+        }
+        let is_animecix = url.contains("animecix.tv");
+        if is_animecix && !xsrf_token.is_empty() && !spec.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-xsrf-token")) {
+            extra.push(("X-XSRF-TOKEN".to_string(), xsrf_token.to_string()));
+        }
+        if is_animecix && matches!(spec.method, Method::Post) && !spec.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("origin")) {
+            extra.push(("Origin".to_string(), "https://animecix.tv".to_string()));
+        }
     }
 
     let mut rb = match spec.method {
@@ -256,8 +272,11 @@ fn exec_cascade(rt: &tokio::runtime::Runtime, inner: &Inner, spec: &Spec) -> Res
         let clearance = inner.cf_clearance.lock().map(|g| g.clone()).unwrap_or_default();
         let connect_sid = inner.connect_sid.lock().map(|g| g.clone()).unwrap_or_default();
         let mut xsrf_token = inner.xsrf_token.lock().map(|g| g.clone()).unwrap_or_default();
+        let api_token = inner.api_token.lock().map(|g| g.clone()).unwrap_or_default();
 
-        if xsrf_token.len() < 10 && spec.url.contains("animecix.tv") && matches!(spec.method, Method::Post) {
+        let is_mobile = spec.url.contains("/api/v1/");
+
+        if !is_mobile && xsrf_token.len() < 10 && spec.url.contains("animecix.tv") && matches!(spec.method, Method::Post) {
             let bs_spec = Spec {
                 method: Method::Get,
                 url: "https://animecix.tv/secure/bootstrap-data".to_string(),
@@ -266,7 +285,7 @@ fn exec_cascade(rt: &tokio::runtime::Runtime, inner: &Inner, spec: &Spec) -> Res
                 json_body: None,
                 timeout_secs: Some(5),
             };
-            if let Ok(bs_resp) = exec_on(rt, client, &bs_spec, &clearance, &connect_sid, "") {
+            if let Ok(bs_resp) = exec_on(rt, client, &bs_spec, &clearance, &connect_sid, "", "") {
                 if let Some(tok) = extract_cookie_val(&bs_resp.headers, "XSRF-TOKEN") {
                     if let Ok(mut g) = inner.xsrf_token.lock() {
                         *g = tok.clone();
@@ -276,7 +295,7 @@ fn exec_cascade(rt: &tokio::runtime::Runtime, inner: &Inner, spec: &Spec) -> Res
             }
         }
 
-        let res = exec_on(rt, client, spec, &clearance, &connect_sid, &xsrf_token);
+        let res = exec_on(rt, client, spec, &clearance, &connect_sid, &xsrf_token, &api_token);
         match &res {
             Ok(r) if r.status != 403 => {
                 inner.last_good.store(*idx, Ordering::Relaxed);
@@ -293,7 +312,7 @@ fn exec_cascade(rt: &tokio::runtime::Runtime, inner: &Inner, spec: &Spec) -> Res
                 return res;
             }
             Ok(r) if r.status == 403 => {
-                if spec.url.contains("animecix.tv") && matches!(spec.method, Method::Post) {
+                if !is_mobile && spec.url.contains("animecix.tv") && matches!(spec.method, Method::Post) {
                     let bs_spec = Spec {
                         method: Method::Get,
                         url: "https://animecix.tv/secure/bootstrap-data".to_string(),
@@ -302,12 +321,12 @@ fn exec_cascade(rt: &tokio::runtime::Runtime, inner: &Inner, spec: &Spec) -> Res
                         json_body: None,
                         timeout_secs: Some(5),
                     };
-                    if let Ok(bs_resp) = exec_on(rt, client, &bs_spec, &clearance, &connect_sid, "") {
+                    if let Ok(bs_resp) = exec_on(rt, client, &bs_spec, &clearance, &connect_sid, "", "") {
                         if let Some(tok) = extract_cookie_val(&bs_resp.headers, "XSRF-TOKEN") {
                             if let Ok(mut g) = inner.xsrf_token.lock() {
                                 *g = tok.clone();
                             }
-                            let retry_res = exec_on(rt, client, spec, &clearance, &connect_sid, &tok);
+                            let retry_res = exec_on(rt, client, spec, &clearance, &connect_sid, &tok, &api_token);
                             if let Ok(ref rr) = retry_res {
                                 if rr.status != 403 {
                                     inner.last_good.store(*idx, Ordering::Relaxed);
@@ -382,8 +401,21 @@ impl Http {
                 cf_clearance: Mutex::new(String::new()),
                 connect_sid: Mutex::new(String::new()),
                 xsrf_token: Mutex::new(String::new()),
+                api_token: Mutex::new(String::new()),
             }),
         })
+    }
+
+    /// Mobil API Bearer tokenini kaydeder.
+    pub fn set_api_token(&self, v: &str) {
+        let v = v.trim();
+        if let Ok(mut g) = self.inner.api_token.lock() {
+            *g = v.to_string();
+        }
+    }
+
+    pub fn api_token(&self) -> String {
+        self.inner.api_token.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Cloudflare biletini kaydeder (boş string temizler). Log'a yazılmaz.

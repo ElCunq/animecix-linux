@@ -398,6 +398,9 @@ pub struct Settings {
     /// AnimeciX XSRF token
     #[serde(default)]
     pub xsrf_token: String,
+    /// AnimeciX Mobil API Bearer Token
+    #[serde(default)]
+    pub api_token: String,
     /// Oturum açmış AnimeciX kullanıcı profili
     #[serde(default)]
     pub user_profile: Option<UserProfile>,
@@ -821,6 +824,7 @@ impl Default for Settings {
             download_dir: None,
             connect_sid: String::new(),
             xsrf_token: String::new(),
+            api_token: String::new(),
             user_profile: None,
             auto_next_episode: default_true(),
         }
@@ -939,6 +943,9 @@ impl Client {
         let s = c.load_settings();
         c.http.set_cf_clearance(&s.cf_clearance);
         c.http.set_connect_sid(&s.connect_sid);
+        if !s.api_token.is_empty() {
+            c.http.set_api_token(&s.api_token);
+        }
         if s.xsrf_token.len() >= 10 {
             c.http.set_xsrf_token(&s.xsrf_token);
         }
@@ -2873,32 +2880,6 @@ impl Client {
             st.history.truncate(500);
         }
         self.save_state(&st);
-
-        if self.is_logged_in() {
-            let http = self.http.clone();
-            let body = serde_json::json!({
-                "id": t.id,
-                "name": t.name,
-                "poster": t.poster,
-                "title_type": t.title_type,
-                "year": t.year,
-                "season_count": t.season_count,
-                "season": {
-                    "number": e.season,
-                    "season_number": e.season,
-                    "episodes": [{
-                        "episode_number": e.episode,
-                        "season_number": e.season,
-                    }]
-                }
-            });
-            std::thread::spawn(move || {
-                let _ = http.post(format!("{BASE}/secure/history/put-title"))
-                    .header("Content-Type", "application/json")
-                    .json(&body)
-                    .send();
-            });
-        }
     }
 
 
@@ -3062,51 +3043,54 @@ impl Client {
 
     pub fn is_logged_in(&self) -> bool {
         let s = self.load_settings();
-        !s.connect_sid.is_empty() && s.user_profile.is_some()
+        (!s.api_token.is_empty() || !s.connect_sid.is_empty()) && s.user_profile.is_some()
     }
 
     pub fn current_user(&self) -> Option<UserProfile> {
         self.load_settings().user_profile
     }
 
-    /// E-posta ve şifre ile AnimeciX'e doğrudan giriş yapar.
+    /// E-posta ve şifre ile AnimeciX Mobil API üzerinden doğrudan giriş yapar.
     pub fn login(&self, email: &str, password: &str) -> Result<UserProfile, String> {
+        let device_name = format!("AnimeciX Desktop ({}-{})", std::env::consts::OS, std::env::consts::ARCH);
         let body = serde_json::json!({
             "email": email.trim(),
             "password": password,
-            "remember": true
+            "token_name": device_name
         });
-        let resp = self.http.post(format!("{BASE}/secure/auth/login"))
+        let resp = self.http.post(format!("{BASE}/api/v1/auth/login"))
             .header("Content-Type", "application/json")
-            .header("Origin", BASE)
-            .header("Referer", "https://animecix.tv/")
+            .header("Accept", "application/json")
             .json(&body)
             .send()
             .map_err(|e| format!("Giriş isteği başarısız: {e}"))?;
 
-        if resp.status() == 403 {
-            return Err("Cloudflare engeliyle karşılaşıldı. Lütfen Ayarlar'dan 'Çerez ile Bağla' seçeneğini kullanarak tarayıcınızdaki connect.sid ile bağlanın.".into());
+        let status = resp.status();
+        if status == 401 || status == 403 {
+            return Err("E-posta veya şifre hatalı.".into());
         }
-
-        let sid = resp.set_cookie_val("connect.sid");
-        let xsrf = resp.set_cookie_val("XSRF-TOKEN");
+        if !(200..300).contains(&status) {
+            return Err(format!("Giriş başarısız (HTTP {status})"));
+        }
 
         let val: serde_json::Value = resp.json().map_err(|e| format!("Yanıt JSON olarak okunamadı: {e}"))?;
-        if val.get("success").and_then(|s| s.as_bool()) != Some(true) {
-            let msg = val.get("message").and_then(|m| m.as_str()).unwrap_or("Giriş bilgileri hatalı veya kullanıcı bulunamadı");
-            return Err(msg.to_string());
-        }
 
-        let user_val = val.get("user").ok_or_else(|| "Kullanıcı bilgisi yanıtta bulunamadı".to_string())?;
+        let token = val.get("accessToken")
+            .or_else(|| val.get("token"))
+            .or_else(|| val.get("user").and_then(|u| u.get("accessToken").or_else(|| u.get("token"))))
+            .or_else(|| val.get("data").and_then(|d| d.get("accessToken").or_else(|| d.get("token"))))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Giriş yanıtında erişim tokeni (accessToken) bulunamadı".to_string())?
+            .to_string();
+
+        let user_val = val.get("user")
+            .or_else(|| val.get("data").and_then(|d| d.get("user")))
+            .unwrap_or(&val);
         let user = parse_user_profile(user_val);
 
+        self.http.set_api_token(&token);
         let mut s = self.load_settings();
-        if let Some(sid) = sid {
-            s.connect_sid = sid;
-        }
-        if let Some(xsrf) = xsrf {
-            s.xsrf_token = xsrf;
-        }
+        s.api_token = token;
         s.user_profile = Some(user.clone());
         self.save_settings(&s);
 
@@ -3231,10 +3215,14 @@ impl Client {
 
     pub fn logout(&self) {
         let mut s = self.load_settings();
+        s.api_token.clear();
         s.connect_sid.clear();
         s.xsrf_token.clear();
         s.user_profile = None;
         self.save_settings(&s);
+        self.http.set_api_token("");
+        self.http.set_connect_sid("");
+        self.http.set_xsrf_token("");
     }
 
     /// Buluttan kaldığın yeri sorgular (saniye cinsinden döner).
@@ -3244,19 +3232,20 @@ impl Client {
         }
         let body = serde_json::json!({
             "titleId": title_id,
-            "seasonNumber": season,
-            "episodeNumber": episode
+            "seasonNumber": season as f64,
+            "episodeNumber": episode as f64,
+            "time": 0
         });
-        let resp = self.http.post(format!("{BASE}/secure/history/get-current-time"))
+        let resp = self.http.post(format!("{BASE}/api/v1/history/get-current-time"))
             .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
             .json(&body)
             .send()
             .ok()?;
         if (200..300).contains(&resp.status()) {
             let val: serde_json::Value = resp.json().ok()?;
-            let ms = val.get("time").and_then(|t| t.as_f64()).unwrap_or(0.0);
-            if ms > 0.0 {
-                let secs = ms / 1000.0;
+            let secs = val.get("time").and_then(|t| t.as_f64()).unwrap_or(0.0);
+            if secs > 0.0 {
                 let key = format!("{title_id}:{season}:{episode}");
                 let mut st = self.load_state();
                 let dur = st.progress.get(&key).map(|(_, d)| *d).unwrap_or(0.0);
@@ -3268,19 +3257,20 @@ impl Client {
         None
     }
 
-    /// Buluta izleme konumunu bildirir (saniye cinsinden alır, ms olarak gönderir).
+    /// Buluta izleme konumunu bildirir (saniye cinsinden gönderir).
     pub fn report_cloud_progress(&self, title_id: u64, season: u64, episode: u64, pos_secs: f64) -> Result<(), String> {
         if !self.is_logged_in() {
             return Ok(());
         }
         let body = serde_json::json!({
             "titleId": title_id,
-            "seasonNumber": season,
-            "episodeNumber": episode,
-            "time": (pos_secs * 1000.0) as u64
+            "seasonNumber": season as f64,
+            "episodeNumber": episode as f64,
+            "time": pos_secs as u64
         });
-        let resp = self.http.post(format!("{BASE}/secure/history/report-current-time"))
+        let resp = self.http.post(format!("{BASE}/api/v1/history/report-current-time"))
             .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
             .json(&body)
             .send()
             .map_err(|e| format!("İlerleme bildirilemedi: {e}"))?;
@@ -3371,8 +3361,7 @@ impl Client {
         let _guard = SyncGuard;
 
         // Sayfa 0'ı çek (AnimeciX API sayfalama 0 tabanlıdır; 0 en son izlenenleri içerir)
-        let resp = self.http.get(format!("{BASE}/secure/history/get-titles?page=0&query="))
-            .header("Referer", "https://animecix.tv/")
+        let resp = self.http.get(format!("{BASE}/api/v1/history/get-titles?page=0"))
             .send()
             .map_err(|e| format!("Geçmiş çekilemedi: {e}"))?;
         let val: serde_json::Value = resp.json().map_err(|e| format!("Geçmiş JSON çözülemedi: {e}"))?;
@@ -3581,8 +3570,7 @@ impl Client {
         // Kalan sayfaları (Sayfa 1..max_pages) çek ve işle
         for page in 1..max_pages {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let page_resp = match self.http.get(format!("{BASE}/secure/history/get-titles?page={page}&query="))
-                .header("Referer", "https://animecix.tv/")
+            let page_resp = match self.http.get(format!("{BASE}/api/v1/history/get-titles?page={page}"))
                 .send() {
                     Ok(r) if (200..300).contains(&r.status()) => r,
                     _ => break,
@@ -4933,6 +4921,24 @@ mod fansub_tests {
         assert_eq!(vid_s, Some(1));
         assert_eq!(vid_ep, Some(129));
         assert_eq!(vid_name.as_deref(), Some("129. Bölüm"));
+    }
+
+    #[test]
+    fn mobile_progress_body_and_units() {
+        let pos_secs: f64 = 745.8;
+        let title_id = 258u64;
+        let season = 1u64;
+        let episode = 133u64;
+        let body = serde_json::json!({
+            "titleId": title_id,
+            "seasonNumber": season as f64,
+            "episodeNumber": episode as f64,
+            "time": pos_secs as u64
+        });
+        assert_eq!(body["time"], 745);
+        assert_eq!(body["titleId"], 258);
+        assert_eq!(body["seasonNumber"], 1.0);
+        assert_eq!(body["episodeNumber"], 133.0);
     }
 
     #[test]
