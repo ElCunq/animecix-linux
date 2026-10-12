@@ -3052,7 +3052,7 @@ impl Client {
 
     /// E-posta ve şifre ile AnimeciX Mobil API üzerinden doğrudan giriş yapar.
     pub fn login(&self, email: &str, password: &str) -> Result<UserProfile, String> {
-        let device_name = format!("AnimeciX Desktop ({}-{})", std::env::consts::OS, std::env::consts::ARCH);
+        let device_name = "Samsung Galaxy S23 Ultra (SM-S918B)";
         let body = serde_json::json!({
             "email": email.trim(),
             "password": password,

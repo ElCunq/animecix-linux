@@ -182,7 +182,7 @@ fn exec_on(
     let is_mobile_api = url.contains("/api/v1/");
     let mut extra: Vec<(String, String)> = if is_mobile_api {
         let mut h = Vec::new();
-        h.push(("User-Agent".to_string(), "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.141 Safari/537.36 ANIMECIXMOBILE".to_string()));
+        h.push(("User-Agent".to_string(), "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 ANIMECIXMOBILE".to_string()));
         h.push(("Accept".to_string(), "application/json".to_string()));
         if !api_token.is_empty() {
             h.push(("Authorization".to_string(), format!("Bearer {api_token}")));
