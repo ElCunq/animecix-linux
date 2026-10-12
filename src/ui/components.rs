@@ -24,7 +24,7 @@ pub fn marathon_button(client: &Client, t: &Title) -> gtk::Button {
     let b = gtk::Button::from_icon_name(if in_marathon {
         "media-playlist-repeat-symbolic"
     } else {
-        "flag-symbolic"
+        "bookmark-new-symbolic"
     });
     b.add_css_class("flat");
     b.add_css_class("circular");
